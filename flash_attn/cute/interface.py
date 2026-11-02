@@ -111,6 +111,15 @@ def _get_device_arch():
     return major * 10 + int(minor)
 
 
+def _get_device_capability() -> int:
+    """Major compute capability only (9 = Hopper, 10 = Blackwell SM100, 11 = SM110/SM120).
+
+    The low-precision (FP4/FP8) drivers dispatch on the major version alone, since the
+    block-scaled tcgen05 paths are an SM100-family feature and are not minor-version specific.
+    """
+    return _get_device_arch() // 10
+
+
 @lru_cache(maxsize=None)
 def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
     """Validate head dimension constraints based on compute capability."""

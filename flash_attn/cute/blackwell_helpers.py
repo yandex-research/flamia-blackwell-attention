@@ -1,18 +1,20 @@
 # Copyright (c) 2025, Tri Dao.
-import os
-from typing import Optional, Tuple
+# Portions of this file are adapted from the FP4 FlashAttention-4 forward of
+# hao-ai-lab/flash-attention-fp4 (https://github.com/hao-ai-lab/flash-attention-fp4,
+# branch fp4, commit 5aa37a96), BSD-3-Clause.
 from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Boolean, const_expr, Float32
-from cutlass.cutlass_dsl import T
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 import flash_attn.cute.mma_sm100_desc as sm100_desc
+from flash_attn.cute.utils import parse_swizzle_from_pointer
 
 
 def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
@@ -25,26 +27,6 @@ def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
     # cutlass-dsl >=4.5.2 builds plain FP8 MMAs as MmaF8F6F4Op (make_trivial_tiled_mma's
     # _F8F6F4_TYPES branch); <4.4.x returned the now-legacy MmaFP8Op. Both map to kind::f8f6f4.
     if isinstance(op, (tcgen05.mma.MmaFP8Op, tcgen05.mma.MmaF8F6F4Op)):
-        return "f8f6f4"
-    if isinstance(op, tcgen05.mma.MmaMXF8Op):
-        return "mxf8f6f4"
-    if isinstance(op, tcgen05.mma.MmaMXF4Op):
-        return "mxf4"
-    if isinstance(op, tcgen05.mma.MmaMXF4NVF4Op):
-        return "mxf4nvf4"
-    raise TypeError(f"Unsupported tcgen05 MMA op kind: {type(op).__name__}")
-
-
-def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
-    if isinstance(op, tcgen05.mma.MmaF16BF16Op):
-        return "f16"
-    if isinstance(op, tcgen05.mma.MmaTF32Op):
-        return "tf32"
-    if isinstance(op, tcgen05.mma.MmaI8Op):
-        return "i8"
-    if isinstance(op, tcgen05.mma.MmaFP8Op) if hasattr(tcgen05.mma, 'MmaFP8Op') else False:
-        return "f8f6f4"
-    if hasattr(tcgen05.mma, 'MmaF8F6F4Op') and isinstance(op, tcgen05.mma.MmaF8F6F4Op):
         return "f8f6f4"
     if isinstance(op, tcgen05.mma.MmaMXF8Op):
         return "mxf8f6f4"
@@ -428,17 +410,15 @@ def gemm_ptx_partial(
     mbar_ptr: Optional[cutlass.Pointer] = None,
     mbar_phase: Optional[Int32] = None,
     split_arrive: Optional[int] = None,
+    # Low-precision PV split: index (in K-tiles) of the embedded mbarrier wait, given directly
+    # instead of derived from `split_arrive`. The block-scaled PV GEMM hands P over in chunks, and
+    # this must match the producer's hand-off fraction -- a smaller value here reads unwritten TMEM.
+    pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
     zero_init: bool | Boolean = False,
     # sA_offset: Int32 = 0,
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
     cta_group: int = 1,
-    pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
-    # (ts_addr_begin, ts_addr_end): addresses where %clock is stored right
-    # before / after the embedded mbarrier wait (pipeline tracing).
-    prof_ts_addrs: Optional[tuple] = None,
-    # When True the ts addresses are in shared memory: cvta.to.shared + st.shared.
-    prof_ts_smem: cutlass.Constexpr[bool] = False,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -564,55 +544,23 @@ def gemm_ptx_partial(
         ]
         if const_expr(mbar_ptr is not None):
             assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
+            assert split_arrive is not None or pre_mbar_tiles is not None, (
+                "split_arrive or pre_mbar_tiles must be provided when mbar_ptr is not None"
+            )
             if const_expr(pre_mbar_tiles is not None):
                 split_arrive_idx = pre_mbar_tiles
-            elif const_expr(split_arrive is not None):
-                split_arrive_idx = split_arrive // op.shape_mnk[2]
             else:
-                split_arrive_idx = cute.size(tCrA.shape[2]) // 4 * 3
+                split_arrive_idx = split_arrive // op.shape_mnk[2]
             input_args.append(mbar_ptr.toint().ir_value())
             input_args.append(Int32(mbar_phase).ir_value())
-            if const_expr(prof_ts_addrs is not None):
-                # Store %clock around the wait so the trace shows the actual
-                # measured wait window instead of an estimate.
-                input_args.append(Int64(prof_ts_addrs[0]).ir_value())
-                input_args.append(Int64(prof_ts_addrs[1]).ir_value())
-                if const_expr(prof_ts_smem):
-                    _ts_store = (
-                        ".reg .u64 prof_sb; \n\t"
-                        ".reg .u64 prof_se; \n\t"
-                        "cvta.to.shared.u64 prof_sb, $6; \n\t"
-                        "cvta.to.shared.u64 prof_se, $7; \n\t"
-                    )
-                    _ts_b = "@leader_thread st.shared.u32 [prof_sb], prof_clk; \n\t"
-                    _ts_e = "@leader_thread st.shared.u32 [prof_se], prof_clk; \n\t"
-                else:
-                    _ts_store = ""
-                    _ts_b = "@leader_thread st.global.u32 [$6], prof_clk; \n\t"
-                    _ts_e = "@leader_thread st.global.u32 [$7], prof_clk; \n\t"
-                mbar_wait_str = (
-                    ".reg .pred P1; \n\t"
-                    ".reg .b32 prof_clk; \n\t"
-                    + _ts_store +
-                    "mov.u32 prof_clk, %clock; \n\t"
-                    + _ts_b +
-                    "LAB_WAIT: \n\t"
-                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
-                    "@P1 bra DONE; \n\t"
-                    "bra     LAB_WAIT; \n\t"
-                    "DONE: \n\t"
-                    "mov.u32 prof_clk, %clock; \n\t"
-                    + _ts_e
-                )
-            else:
-                mbar_wait_str = (
-                    ".reg .pred P1; \n\t"
-                    "LAB_WAIT: \n\t"
-                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
-                    "@P1 bra DONE; \n\t"
-                    "bra     LAB_WAIT; \n\t"
-                    "DONE: \n\t"
-                )
+            mbar_wait_str = (
+                ".reg .pred P1; \n\t"
+                "LAB_WAIT: \n\t"
+                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
+                "@P1 bra DONE; \n\t"
+                "bra     LAB_WAIT; \n\t"
+                "DONE: \n\t"
+            )
         else:
             mbar_wait_str = ""
         llvm.inline_asm(
@@ -672,9 +620,7 @@ def gemm_ptx_partial(
                 else ""
             )
             + "}\n",
-            "r,r,r,r"
-            if const_expr(mbar_ptr is None)
-            else ("r,r,r,r,r,r" if const_expr(prof_ts_addrs is None) else "r,r,r,r,r,r,l,l"),
+            "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -1183,11 +1129,13 @@ def gemm_ptx_precomputed_varname(
         )
 
 
-# ---------------------------------------------------------------------------
-# FP4/MXFP8 block-scaled MMA helpers
-# ---------------------------------------------------------------------------
-
-
+# ===========================================================================
+# Low-precision (NVFP4 / MXFP4 / MXFP8) additions.
+# Block-scaled MMA paths, scale-factor SMEM layouts, and the packed FP32 ->
+# E2M1 / UE4M3 / UE8M0 conversion intrinsics (including the hardware
+# stochastic-rounding cvt.rs atoms) used by the low-precision attention
+# kernels. Additive: every shared upstream helper above is untouched.
+# ===========================================================================
 def _is_pure_fp8_mma(op: cute.nvgpu.tcgen05.mma.MmaOp) -> bool:
     return (
         not hasattr(op, "sf_dtype")
@@ -1197,8 +1145,20 @@ def _is_pure_fp8_mma(op: cute.nvgpu.tcgen05.mma.MmaOp) -> bool:
 
 
 def _mma_inst_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
+    cg = 2 if getattr(op, "cta_group", None) == tcgen05.CtaGroup.TWO else 1
+    return _mma_inst_kind_1cta(op).replace("cta_group::1", f"cta_group::{cg}")
+
+
+def _mma_inst_kind_1cta(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
     if hasattr(op, "sf_dtype"):
         if op.a_dtype is cutlass.Float4E2M1FN:
+            if op.sf_dtype is cutlass.Float8E8M0FNU:
+                # MXFP4: E2M1 with UE8M0 per 32 -> scale_vec::2X (2 SFs per K64
+                # tile; the per-tile SF-ID steps by half-words, see sfa_id
+                # below). Emitted as kind::mxf4nvf4, the form the CUTLASS DSL
+                # itself emits for MmaMXF4Op. Needs the mxf4-kind instruction
+                # descriptor layout (mma_sm100_desc.make_instr_desc_block_scaled).
+                return "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::2X"
             return "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X"
         return "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X"
     if _is_pure_fp8_mma(op):
@@ -1227,7 +1187,13 @@ def gemm_blockscaled_generic(
     num_k = const_expr(cute.size(tCrA.shape[2]))
     mma_atom = cute.make_mma_atom(tiled_mma.op)
     for k in cutlass.range_constexpr(num_k):
-        mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
+        # zero_init may be a dynamic Boolean (PV path: first KV block of a tile).
+        if const_expr(k != 0):
+            mma_atom.set(tcgen05.Field.ACCUMULATE, True)
+        elif const_expr(isinstance(zero_init, bool)):
+            mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init)
+        else:
+            mma_atom.set(tcgen05.Field.ACCUMULATE, zero_init == False)
         mma_atom.set(tcgen05.Field.SFA, tScaleA[None, None, k].iterator)
         mma_atom.set(tcgen05.Field.SFB, tScaleB[None, None, k].iterator)
         cute.gemm(
@@ -1260,6 +1226,11 @@ def gemm_ptx_partial_fp4(
     # When True the ts addresses are in shared memory: emit cvta.to.shared +
     # st.shared instead of st.global (smem-buffered profiling).
     prof_ts_smem: cutlass.Constexpr[bool] = False,
+    # Dynamic TMEM column offsets (u32 columns) added to every per-K-tile SF address of A / B.
+    # Used by the backward's 64-row query tiles: their SF atom is 128 rows, rows 64-127 of the
+    # atom sit +2 columns in the same 32 lanes (E29 lesson), selected per m_block at run time.
+    sfa_col_offset: Optional[Int32] = None,
+    sfb_col_offset: Optional[Int32] = None,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
@@ -1324,14 +1295,6 @@ def gemm_ptx_partial_fp4(
     offset_sfb = [o // 4 for o in sfb_elem_off]
     sfa_id = [o % 4 for o in sfa_elem_off]
     sfb_id = [o % 4 for o in sfb_elem_off]
-    if os.getenv("FA4_DEBUG_SF_OFFSETS", "0") == "1":
-        print(
-            f"GEMM_PTX_FP4 kind={_mma_inst_kind(op)} is_ts={is_ts}\n"
-            f"  offset_sfa={offset_sfa} sfa_id={sfa_id}\n"
-            f"  offset_sfb={offset_sfb} sfb_id={sfb_id}\n"
-            f"  tScaleA.layout={tScaleA.layout}\n  tScaleB.layout={tScaleB.layout}\n"
-            f"  tCrA.layout={tCrA.layout} tCrB.layout={tCrB.layout}"
-        )
     if const_expr(not is_ts):
         smem_desc_start_a_lo = Int32(
             smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
@@ -1345,14 +1308,26 @@ def gemm_ptx_partial_fp4(
     if const_expr(not is_ts):
         assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
         num_k = const_expr(cute.size(tCrA.shape[2]))
-        scale_A_addrs = [
-            Int32(cute.arch.make_warp_uniform(tScaleA[None, None, k].iterator.toint())).ir_value()
-            for k in range(num_k)
-        ]
-        scale_B_addrs = [
-            Int32(cute.arch.make_warp_uniform(tScaleB[None, None, k].iterator.toint())).ir_value()
-            for k in range(num_k)
-        ]
+        if const_expr(sfa_col_offset is not None):
+            scale_A_addrs = [
+                Int32(cute.arch.make_warp_uniform(Int32(tScaleA[None, None, k].iterator.toint()) + sfa_col_offset)).ir_value()
+                for k in range(num_k)
+            ]
+        else:
+            scale_A_addrs = [
+                Int32(cute.arch.make_warp_uniform(tScaleA[None, None, k].iterator.toint())).ir_value()
+                for k in range(num_k)
+            ]
+        if const_expr(sfb_col_offset is not None):
+            scale_B_addrs = [
+                Int32(cute.arch.make_warp_uniform(Int32(tScaleB[None, None, k].iterator.toint()) + sfb_col_offset)).ir_value()
+                for k in range(num_k)
+            ]
+        else:
+            scale_B_addrs = [
+                Int32(cute.arch.make_warp_uniform(tScaleB[None, None, k].iterator.toint())).ir_value()
+                for k in range(num_k)
+            ]
         mma_inst_str = const_expr(_mma_inst_kind(op))
         sfa_op_base = 4
         sfb_op_base = 4 + num_k
@@ -1573,44 +1548,51 @@ def gemm_ptx_partial_fp4(
         )
 
 
-@cute.jit
-def gemm_ptx_partial_fp8(
-    op: cute.nvgpu.tcgen05.mma.MmaOp,
-    acc_tmem_addr: Int32,
-    tCrA: cute.Tensor,
-    tCrB: cute.Tensor,
-    sA: Optional[cute.Tensor],
-    sB: cute.Tensor,
-    tScaleA: cute.Tensor,
-    tScaleB: cute.Tensor,
-    mbar_ptr: Optional[cutlass.Pointer] = None,
-    mbar_phase: Optional[Int32] = None,
-    zero_init: bool | Boolean = False,
-    tA_addr: Optional[Int32] = None,
-    pre_mbar_tiles: Optional[cutlass.Constexpr[int]] = None,
-    prof_ts_addrs: Optional[tuple] = None,
-    prof_ts_smem: cutlass.Constexpr[bool] = False,
-) -> None:
-    return gemm_ptx_partial_fp4(
-        op,
-        acc_tmem_addr,
-        tCrA,
-        tCrB,
-        sA,
-        sB,
-        tScaleA,
-        tScaleB,
-        mbar_ptr=mbar_ptr,
-        mbar_phase=mbar_phase,
-        zero_init=zero_init,
-        tA_addr=tA_addr,
-        pre_mbar_tiles=pre_mbar_tiles,
-        prof_ts_addrs=prof_ts_addrs,
-        prof_ts_smem=prof_ts_smem,
+@dsl_user_op
+def packed_ue4m3_to_float(w: Int32, *, loc=None, ip=None) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Inverse of packed_float_to_ue4m3: the 4 E4M3 bytes of w (byte 0 = f0) -> 4 FP32 values (e4m3x2 -> f16x2 -> f32)."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Int32(w).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b16 lo, hi, h0, h1, h2, h3;\n\t"
+        ".reg .b32 p0, p1;\n\t"
+        "mov.b32 {lo, hi}, $4;\n\t"
+        "cvt.rn.f16x2.e4m3x2 p0, lo;\n\t"
+        "cvt.rn.f16x2.e4m3x2 p1, hi;\n\t"
+        "mov.b32 {h0, h1}, p0;\n\t"
+        "mov.b32 {h2, h3}, p1;\n\t"
+        "cvt.f32.f16 $0, h0;\n\t"
+        "cvt.f32.f16 $1, h1;\n\t"
+        "cvt.f32.f16 $2, h2;\n\t"
+        "cvt.f32.f16 $3, h3;\n\t"
+        "}\n",
+        "=f,=f,=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(4))
 
 
 # FP4 Quantization helper functions
+@cute.jit
+def packed_float_to_e4m3x4_rs(f0, f1, f2, f3, r):
+    """4 FP32 values -> 4 packed E4M3 bytes (element 0 in the low byte) with hardware stochastic rounding: one 4-wide
+    cvt.rs (8 random bits per element added to the discarded mantissa bits), random word r. No more instructions than the
+    round-to-nearest pack it replaces (two 2-wide cvt.rn plus the packing mov)."""
+    out = llvm.inline_asm(
+        T.i32(),
+        [Float32(f).ir_value() for f in (f0, f1, f2, f3)] + [Int32(r).ir_value()],
+        "cvt.rs.satfinite.e4m3x4.f32 $0, {$4, $3, $2, $1}, $5;",
+        "=r,f,f,f,f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out)
+
+
 @cute.jit
 def packed_float_to_ue4m3(
     f0: Float32, f1: Float32, f2: Float32, f3: Float32, *, loc=None, ip=None
@@ -1685,6 +1667,157 @@ def packed_float_to_e2m1(
     return Int32(out_uint32)
 
 
+# Direct-P classifier constants. Adding the magic 1.5*2^23 to a value in log2 units places the
+# integer part in the exponent field and the fraction in the mantissa, so a single LEA turns the
+# bit pattern into Mitchell's 2^x approximation and cvt.rn.satfinite.e2m1x2 then rounds it to E2M1.
+DIRECTP_FRAC_BITS = 16
+DIRECTP_LEA_ADD = ((127 << 23) - ((0x4B400000 << (23 - DIRECTP_FRAC_BITS)) & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+# cvt.rs.e2m1x4 takes its random bits from one word: the operand list {a,b,c,d} is MSB-first
+# (d -> nibble 0) and the half-ulp bit of nibble 0/1/2/3 is bit 23/0/31/8 of that word.
+E2M1X4_RS_HALF_ULP = 0x80800101
+
+def packed_mitchell_to_e2m1(
+    t0: Float32,
+    t1: Float32,
+    t2: Float32,
+    t3: Float32,
+    t4: Float32,
+    t5: Float32,
+    t6: Float32,
+    t7: Float32,
+    *,
+    use_imad: bool = False,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """8 magic-number floats t_i (see DIRECTP_*) -> the E2M1 codes of Mitchell's 2^x_i packed
+    in a uint32 (element 0 in the low nibble). One LEA (or IMAD with `use_imad`) per element and
+    one cvt.rn.satfinite.relu.e2m1x2 per pair; no MUFU."""
+    c = DIRECTP_LEA_ADD if DIRECTP_LEA_ADD < 2**31 else DIRECTP_LEA_ADD - 2**32
+    sh = 23 - DIRECTP_FRAC_BITS
+    movs = "".join(f"mov.b32 a{i}, ${i + 1};\n\t" for i in range(8))
+    if use_imad:
+        lea = "".join(f"mad.lo.s32 b{i}, a{i}, {1 << sh}, {c};\n\t" for i in range(8))
+    else:
+        lea = "".join(f"shl.b32 b{i}, a{i}, {sh};\n\tadd.s32 b{i}, b{i}, {c};\n\t" for i in range(8))
+    out_uint32 = llvm.inline_asm(
+        T.i32(),
+        [Float32(t).ir_value(loc=loc, ip=ip) for t in (t0, t1, t2, t3, t4, t5, t6, t7)],
+        "{\n\t"
+        ".reg .b32 a0, a1, a2, a3, a4, a5, a6, a7;\n\t"
+        ".reg .b32 b0, b1, b2, b3, b4, b5, b6, b7;\n\t"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n\t"
+        + movs
+        + lea
+        + "cvt.rn.satfinite.relu.e2m1x2.f32   byte0, b1, b0;\n\t"
+        "cvt.rn.satfinite.relu.e2m1x2.f32   byte1, b3, b2;\n\t"
+        "cvt.rn.satfinite.relu.e2m1x2.f32   byte2, b5, b4;\n\t"
+        "cvt.rn.satfinite.relu.e2m1x2.f32   byte3, b7, b6;\n\t"
+        "mov.b32 $0, {byte0, byte1, byte2, byte3};\n\t"
+        "}\n",
+        "=r,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out_uint32)
+
+
+def e2m1x8_value_sum2(codes: Int32, acc: Int32, *, loc=None, ip=None) -> Int32:
+    """acc + 2 * (sum of the 8 E2M1 values packed in `codes`): nibble -> byte LUT
+    {0,1,2,3,4,6,8,12} via PRMT (the packed word is its own selector; the sign nibble bit
+    selects PRMT's sign-replicate mode, which yields 0 for these LUT bytes), byte sum via
+    DP4A. 5 ALU/INT instructions per 8 elements, no float ops."""
+    out = llvm.inline_asm(
+        T.i32(),
+        [Int32(codes).ir_value(loc=loc, ip=ip), Int32(acc).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b32 lo, hi, ones, p0, p1, s, a;\n\t"
+        "mov.b32 lo, 0x03020100;\n\t"
+        "mov.b32 hi, 0x0C080604;\n\t"
+        "mov.b32 ones, 0x01010101;\n\t"
+        "prmt.b32 p0, lo, hi, $1;\n\t"
+        "shr.u32 s, $1, 16;\n\t"
+        "prmt.b32 p1, lo, hi, s;\n\t"
+        "dp4a.u32.u32 a, p0, ones, $2;\n\t"
+        "dp4a.u32.u32 $0, p1, ones, a;\n\t"
+        "}\n",
+        "=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out)
+
+
+E2M1_LUT2_LO = 0x03020100   # nibble code -> 2 x E2M1 value, codes 0..3
+E2M1_LUT2_HI = 0x0C080604   # codes 4..7
+
+
+def packed_float_to_e2m1_relu(
+    f0: Float32,
+    f1: Float32,
+    f2: Float32,
+    f3: Float32,
+    f4: Float32,
+    f5: Float32,
+    f6: Float32,
+    f7: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """packed_float_to_e2m1 with the .relu conversion (negative / NaN inputs -> +0)."""
+    out_uint32 = llvm.inline_asm(
+        T.i32(),
+        [Float32(f).ir_value(loc=loc, ip=ip) for f in (f0, f1, f2, f3, f4, f5, f6, f7)],
+        "{\n\t"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n\t"
+        "cvt.rn.satfinite.relu.e2m1x2.f32   byte0, $2, $1;\n\t"
+        "cvt.rn.satfinite.relu.e2m1x2.f32   byte1, $4, $3;\n\t"
+        "cvt.rn.satfinite.relu.e2m1x2.f32   byte2, $6, $5;\n\t"
+        "cvt.rn.satfinite.relu.e2m1x2.f32   byte3, $8, $7;\n\t"
+        "mov.b32 $0, {byte0, byte1, byte2, byte3};\n\t"
+        "}\n",
+        "=r,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(out_uint32)
+
+
+def mitchell_value(t: Float32, *, loc=None, ip=None) -> Float32:
+    """The Mitchell 2^x value (as f32) of one magic-number pattern t (diagnostic row-sum path)."""
+    c = DIRECTP_LEA_ADD if DIRECTP_LEA_ADD < 2**31 else DIRECTP_LEA_ADD - 2**32
+    out = llvm.inline_asm(
+        T.f32(),
+        [Float32(t).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b32 a, b;\n\t"
+        f"mov.b32 a, $1;\n\tshl.b32 b, a, {23 - DIRECTP_FRAC_BITS};\n\tadd.s32 b, b, {c};\n\tmov.b32 $0, b;\n\t"
+        "}\n",
+        "=f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Float32(out)
+
+
+def i32_to_f32(x: Int32, *, loc=None, ip=None) -> Float32:
+    out = llvm.inline_asm(
+        T.f32(),
+        [Int32(x).ir_value(loc=loc, ip=ip)],
+        "cvt.rn.f32.s32 $0, $1;",
+        "=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Float32(out)
+
+
 def tcgen05_after_thread_sync():
     llvm.inline_asm(
         None,
@@ -1695,22 +1828,6 @@ def tcgen05_after_thread_sync():
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
-
-
-# ---------------------------------------------------------------------------
-# Block-scaled SF (scale factor) SMEM/TMEM layout utilities
-#
-# These build the SMEM and TMEM layouts for block-scaled MMA scale factors
-# (SFA / SFB).  The layouts follow the tcgen05 BlockScaledBasicChunk atom
-# defined by the PTX ISA and are tiled to the CTA tile shape.
-#
-# The upstream cutlass.utils.blockscaled_layout helpers hard-code
-# mma_tile_inst_k=4.  This value depends on the number of K-tiles
-# per head: each MMA tile covers 256 bits in K, so NVFP4 (4-bit)
-# spans 64 elements → hdim 128 needs only 2 tiles (mma_tile_inst_k=2),
-# while MXFP8 (8-bit) spans 32 elements → hdim 128 needs 4 tiles.
-# These wrappers accept mma_tile_inst_k as a parameter.
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -1806,7 +1923,7 @@ def tmem_ld_red_max(
     computed in the TMEM controller at zero ALU cost.
 
     If `tile_maxes` is given (size = number of x32 tiles), the per-tile
-    maxes are stored there too — for sf_vec_size=32 quantization (MXFP8 P)
+    maxes are stored there too -- for sf_vec_size=32 quantization (MXFP8 P)
     each x32 tile max IS that scale-factor group's max.
 
     Ported from LopezCastroRoberto/flash-attention perf/ld.red-upstream.
@@ -1846,6 +1963,39 @@ def tmem_ld_red_max(
             tile_maxes[k] = tile_max
         row_max = tile_max if cutlass.const_expr(k == 0) else cute.arch.fmax(row_max, tile_max)
     return row_max
+
+
+@cute.jit
+def tmem_ld_red_max_n(tStS: cute.Tensor, tSrS: cute.Tensor, group_maxes: cute.Tensor, n: cutlass.Constexpr[int]) -> None:
+    """SM103: tmem_ld_red_max with n-wide groups (n = 16 or 32 columns): each x32 tile of the load is read as 32 / n
+    tcgen05.ld.red.x<n> loads at consecutive column addresses, each returning its n values plus their max
+    (PTX ISA 8.8: tcgen05.ld.red.sync.aligned.32x32b.x<N>.f32.max out, redval, [taddr]; N in 2..128). The register
+    order is the plain load's (tile k, then column), so tSrS matches cute.copy's; group_maxes[g] = max of group g."""
+    from cutlass._mlir import ir as _ir
+
+    assert n in (16, 32)
+    tStS_g = cute.group_modes(tStS, 1, cute.rank(tStS.shape))
+    num_tiles = cute.size(tStS_g.shape[1])
+    assert cute.size(tSrS) == num_tiles * 32
+    f32_ty = _ir.F32Type.get()
+    struct_ty = llvm.StructType.get_literal([f32_ty] * (n + 1))
+    asm_str = (f"tcgen05.ld.red.sync.aligned.32x32b.x{n}.f32.max"
+               " {" + ", ".join(f"${i}" for i in range(n)) + "}" + f", ${n}, [${n + 1}];\n")
+    for k in cutlass.range_constexpr(num_tiles):
+        for j in cutlass.range_constexpr(32 // n):
+            addr = tStS_g[None, k].iterator.toint() + cutlass.Int32(n * j)   # TMEM address: the column is the low field
+            result = llvm.inline_asm(
+                struct_ty,
+                [addr.ir_value()],
+                asm_str,
+                "=f," * (n + 1) + "r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+            for i in cutlass.range_constexpr(n):
+                tSrS[k * 32 + j * n + i] = cutlass.Float32(llvm.extractvalue(f32_ty, result, [i]))
+            group_maxes[k * (32 // n) + j] = cutlass.Float32(llvm.extractvalue(f32_ty, result, [n]))
 
 
 @dsl_user_op

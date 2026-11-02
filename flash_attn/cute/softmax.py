@@ -2,7 +2,7 @@
 
 import math
 import operator
-from typing import Tuple
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 import cutlass
@@ -413,7 +413,10 @@ class SoftmaxSm100(Softmax):
     def apply_exp2_convert(
         self,
         acc_S_row: cute.Tensor,
-        acc_S_row_converted: cute.Tensor,
+        # Optional: the low-precision block-scaled paths apply exp2 in place on acc_S_row and
+        # pack it separately (E2M1 / E4M3 with their own scale factors), so they have no
+        # converted tensor to write. Pass None there and the store below is not emitted.
+        acc_S_row_converted: Optional[cute.Tensor] = None,
         ex2_emu_freq: cutlass.Constexpr[int] = 0,
         ex2_emu_res: cutlass.Constexpr[int] = 4,
         ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
@@ -424,9 +427,10 @@ class SoftmaxSm100(Softmax):
         frg_cnt = cute.size(acc_S_row) // frg_tile
         assert cute.size(acc_S_row) % frg_tile == 0
         acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
-        acc_S_row_converted_frg = cute.logical_divide(
-            acc_S_row_converted, cute.make_layout(frg_tile)
-        )
+        if cutlass.const_expr(acc_S_row_converted is not None):
+            acc_S_row_converted_frg = cute.logical_divide(
+                acc_S_row_converted, cute.make_layout(frg_tile)
+            )
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
@@ -449,9 +453,10 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
-            acc_S_row_converted_frg[None, j].store(
-                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
-            )
+            if cutlass.const_expr(acc_S_row_converted is not None):
+                acc_S_row_converted_frg[None, j].store(
+                    acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+                )
 
     @cute.jit
     def scale_apply_exp2_convert(
@@ -502,6 +507,37 @@ class SoftmaxSm100(Softmax):
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )
+
+    # ---------------------------------------------------------------- low precision
+    # Block-scaled PV: P is quantized per group of keys with a per-group scale, so the row sum
+    # accumulates each group's sum times its group scale.
+    @cute.jit
+    def update_row_sum_sage(
+        self,
+        acc_S_row_exp: cute.Tensor,
+        acc_S_row_group_max_exp: cute.Tensor,
+        row_scale: Float32,
+        is_first: int = False,
+    ) -> None:
+        init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
+        vec_size = cutlass.const_expr(
+            cute.size(acc_S_row_exp) // cute.size(acc_S_row_group_max_exp)
+        )
+        acc_S_row_exp_frag = cute.logical_divide(acc_S_row_exp, cute.make_layout(vec_size))
+        acc_S_group_sum = cute.make_rmem_tensor(acc_S_row_group_max_exp.layout, dtype=Float32)
+
+        num_groups = cute.size(acc_S_row_exp_frag, mode=[1])
+        assert num_groups % 2 == 0
+        for i in cutlass.range_constexpr(0, num_groups, 2):
+            acc_S_group_sum[i], acc_S_group_sum[i + 1] = cute.arch.fma_packed_f32x2(
+                (
+                    self._compute_row_sum(acc_S_row_exp_frag[None, i].load()),
+                    self._compute_row_sum(acc_S_row_exp_frag[None, i + 1].load()),
+                ),
+                (acc_S_row_group_max_exp[i], acc_S_row_group_max_exp[i + 1]),
+                (Float32(0.0), Float32(0.0)),
+            )
+        self.row_sum[0] = self._compute_row_sum(acc_S_group_sum.load(), init_val=init_val)
 
 
 @cute.jit

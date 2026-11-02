@@ -1,3 +1,123 @@
+# FLAMIA: FLAsh MIcroscaling Attention
+
+This repository is a fork of [FlashAttention](https://github.com/Dao-AILab/flash-attention), started from upstream
+commit [`1bda8f9`](https://github.com/Dao-AILab/flash-attention/commit/1bda8f9290cd48d030f1516f0e680cd464ef3554).
+The 4-bit forward kernel started from the FP4 FlashAttention-4 forward of
+[hao-ai-lab/flash-attention-fp4](https://github.com/hao-ai-lab/flash-attention-fp4) (branch `fp4`, commit `5aa37a96`),
+developed for Attn-QAT. The first commit after `1bda8f9` imports that code with its authorship.
+On top of the FlashAttention-4 CuTe kernels this fork adds low-precision attention for training on NVIDIA Blackwell
+(B200, B300), with two paths:
+
+- **MXFP8**: E4M3 operands with token-block scales (one power-of-two exponent per 32 tokens and the whole head
+  dimension) in the forward and the backward.
+- **Mixed NVFP4/FP8**: NVFP4 for $QK^\top$ and its recomputation in the backward, E4M3 for the other matrix
+  multiplications.
+
+Inputs, outputs and gradients stay BF16/FP16. Quantization is fused into the kernels. Packed variable-length
+documents run directly in their packed rows, with document-local scales. The rest of this README after the
+FLAMIA sections is the upstream FlashAttention README.
+
+## Low-bit attention
+
+The low-precision code is under `flash_attn/cute/`, the public entry points in `flash_attn/cute/lowprec/`.
+
+**Requirements.** An SM100-class GPU (B200 or B300), CUDA 13.0 or newer, Python 3.10 or newer, PyTorch with
+CUDA 13 support and `nvidia-cutlass-dsl[cu13]==4.8.0`.
+
+```bash
+pip install 'nvidia-cutlass-dsl[cu13]==4.8.0'
+pip install -e "flash_attn/cute[dev,cu13]"
+```
+
+Kernels compile on first use. Set `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` to keep the compiled kernels in an
+on-disk cache between processes.
+
+```python
+import torch
+from flash_attn.cute import flash_attn_fp8, flash_attn_fp4
+
+# Batched: q (b, s, h, d), k / v (b, s, h_kv, d), bf16.
+o = flash_attn_fp8(q, k, v, causal=True)          # MXFP8 path
+o = flash_attn_fp4(q, k, v, causal=True)          # mixed NVFP4/FP8 path
+o.backward(do)
+
+# Packed documents: q (total, h, d), k / v (total, h_kv, d) with cumulative offsets.
+o = flash_attn_fp8(q, k, v, causal=True,
+                   cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=max_len, max_seqlen_k=max_len)
+```
+
+Both entry points take an `options=` object (`FP8AttnOptions`, `FP4AttnOptions`) with the advanced settings.
+`resolve_fp8` / `resolve_fp4` return the plan a call would run, with the reason for each choice, without running it.
+
+**Exact causal options.** The default token-block scales keep a small dependency of earlier outputs on later tokens
+inside one 32-token block, and the FP16 dQ accumulator is pre-scaled from whole-sequence maxima. For batched causal
+calls, the following removes both:
+
+```python
+from flash_attn.cute import FP8AttnOptions
+import flash_attn.cute.interface_bwd_fp4 as bwd
+bwd.DQ_CAUSAL_PRESCALE = True                      # causal dQ scale
+opts = FP8AttnOptions(operand_scaling="token_local", ds_dq_rowlocal="all")
+o = flash_attn_fp8(q, k, v, causal=True, options=opts)
+```
+
+Packed calls use the default scales, whose dependencies stay inside one document.
+
+**Naming.** The 4-bit inference quantizer called Mitchell-P in the paper is called Direct-P in the code.
+
+**Documentation.**
+- [docs/lowprec_usage.md](docs/lowprec_usage.md): installation, setup check, recipes (training, inference, GQA,
+  varlen, options), every argument and option with its default, troubleshooting.
+- [docs/lowprec.md](docs/lowprec.md): API reference, defaults, precision routes, causal-safety guarantees,
+  determinism, caveats, requirements and performance.
+- [docs/lowprec_code_map.md](docs/lowprec_code_map.md): where each part of the implementation lives.
+
+**Tests.**
+
+```bash
+pytest tests/cute/test_lowprec_api.py            # public API, both paths, forward and backward
+pytest tests/cute/test_lowprec_causal_safe_v.py  # causal probes
+pytest tests/cute -k lowprec                     # all low-precision tests
+```
+
+Compilation dominates test time. Compile in parallel without a GPU first, then run:
+
+```bash
+FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -n 64 tests/cute/test_lowprec_api.py
+FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest tests/cute/test_lowprec_api.py
+```
+
+**Benchmarks.** `benchmarks/benchmark_lowprec_attn.py` times our kernels and the baselines (FlashAttention-4, cuDNN,
+FlashInfer, PyTorch SDPA, and, if installed, Low Precision FA4 and HW-FP4 FA4) under one protocol and reports
+accuracy against an FP32 reference. In the backend names, `meta-*` is Low Precision FA4 and `hu-nvmx` is HW-FP4
+FA4. Its docstring lists the backend names, modes, shapes and the environment each baseline needs.
+
+```bash
+python benchmarks/benchmark_lowprec_attn.py --backend ours-fp8,ours-fp4,cudnn-fp8,fa4-bf16 --mode fwd,bwd,step \
+    --shapes b4-s4096-h16-d128 --causal both --jsonl rows.jsonl
+```
+
+`benchmarks/run_packed_docs.py` runs the 18 packed-document workloads of the paper (nine length sets, causal and
+non-causal) for our kernels and every baseline, one process per job, a discarded warm-up round and three timed
+rounds. `summarize_packed_docs.py` turns the rows into the forward, backward and training-call tables with the
+speedup over the fastest baseline. The baselines need their own environments (cuDNN frontend, FlashInfer, Low
+Precision FA4, HW-FP4 FA4), so run the script once per environment into the same output directory:
+
+```bash
+python benchmarks/run_packed_docs.py --out results --groups ours --gpu 0
+/path/to/baseline/env/python benchmarks/run_packed_docs.py --out results --groups baselines --gpu 0
+python benchmarks/summarize_packed_docs.py results
+```
+
+A backend that is not installed, or has no packed-document path, appears as a row with the reason.
+`benchmarks/benchmark_packed_docs.py` runs a single workload (`--set eq4x4096`, `skew8192+224x256`,
+`logu128-8192-t16384-s0`, ...) and documents the layouts and length sets. `benchmarks/benchmark_varlen_sched.py`
+compares the packed-document schedulers.
+
+**License.** BSD-3-Clause, as upstream FlashAttention (see `LICENSE`).
+
+---
+
 # FlashAttention
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
@@ -97,6 +217,26 @@ from flash_attn.cute import flash_attn_func
 
 out = flash_attn_func(q, k, v, causal=True)
 ```
+
+### Low-precision attention (FP4 / FP8, Blackwell)
+
+`flash_attn.cute` also provides 4-bit (NVFP4) and 8-bit (E4M3) attention with forward and backward on Blackwell
+(SM100):
+
+```python
+from flash_attn.cute import flash_attn_fp4, flash_attn_fp8
+
+out = flash_attn_fp4(q, k, v, causal=True)   # bf16 / fp16 in and out; quantisation inside the call
+out = flash_attn_fp8(q, k, v, causal=True)
+```
+
+Documentation:
+- [docs/lowprec_usage.md](docs/lowprec_usage.md): install, setup check, using the functions in place of an
+  attention call, recipes (training, inference, GQA, varlen, options), every argument and option of
+  `flash_attn_fp4` / `flash_attn_fp8` with its default, and troubleshooting.
+- [docs/lowprec.md](docs/lowprec.md): full API reference (every argument and option), defaults, precision
+  routes, causal-safety guarantees, determinism, measured caveats, requirements and performance.
+- [docs/lowprec_code_map.md](docs/lowprec_code_map.md): where each part of the implementation lives.
 
 ## Installation and features
 **Requirements:**

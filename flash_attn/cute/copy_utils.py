@@ -370,3 +370,25 @@ def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsyn
         )
 
     return copy_fn
+
+
+# Low-precision addition: f16 bulk reduce-add, used by the FP4 backward dQ accumulation.
+def cpasync_reduce_bulk_add_f16(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    store_bytes: int | Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """f16 variant of cpasync_reduce_bulk_add_f32 (half the reduce-add bytes)."""
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value()],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.noftz.add.f16 [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )

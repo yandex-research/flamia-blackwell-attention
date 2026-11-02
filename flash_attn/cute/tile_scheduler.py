@@ -29,6 +29,11 @@ from quack.cute_dsl_utils import ParamsBase
 import flash_attn.cute.utils as utils
 from flash_attn.cute.fast_math import clz
 
+# L2 working-set budget assumed when deciding how many KV blocks to keep resident, in MiB.
+# Matches the 50 MB used literally throughout the schedulers below; named here because the
+# low-precision 2-CTA backward's L2 swizzle heuristic needs the same figure.
+_L2_SIZE_MB = 50
+
 
 class SchedulingMode(IntEnum):
     NONE = auto()
@@ -594,6 +599,10 @@ class SingleTileLPTScheduler:
                 params, cute.arch.block_idx()[0], Int32(0), ctx, loc=loc, ip=ip
             )
         tile_idx, split_idx, _ = cute.arch.block_idx()
+        if const_expr(params.cluster_shape_m > 1 and params.use_cluster_idx):
+            # static grid of clusters (the low-precision 2-CTA forward): one tile per cluster, both CTAs of the
+            # cluster read the same tile (num_block counts cluster tiles)
+            tile_idx = cute.arch.cluster_idx()[0]
         return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
     @staticmethod
@@ -605,6 +614,8 @@ class SingleTileLPTScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             return SingleTileLPTScheduler._clc_grid_shape(params)
+        if const_expr(params.cluster_shape_m > 1 and params.use_cluster_idx):
+            return (params.total_blocks * params.cluster_shape_m, params.num_splits, Int32(1))
         return (params.total_blocks, params.num_splits, Int32(1))
 
     @cute.jit
@@ -721,6 +732,445 @@ class SingleTileLPTScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return self.__class__(*obj_list, loc=self._loc)
+
+
+class PersistentLPTScheduler(SingleTileLPTScheduler):
+    """SingleTileLPTScheduler's coordinate mapping (L2 swizzle + longest-first block reversal) on a persistent
+    grid: grid = min(SM count, total_blocks) CTAs, each walking tile_idx = bidx + k * grid. For causal / local
+    forwards, whose per-CTA prologue (launch, TMEM allocation, Q load) was measured at ~8 k cycles per Q tile on
+    the one-tile-per-CTA scheduler. Static scheduling only."""
+
+    @staticmethod
+    def create(
+        params: SingleTileLPTScheduler.Params, ctx: SchedulerState | None = None, *, loc=None, ip=None
+    ) -> "PersistentLPTScheduler":
+        assert params.scheduling_mode == SchedulingMode.STATIC
+        tile_idx, split_idx, _ = cute.arch.block_idx()
+        return PersistentLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: SingleTileLPTScheduler.Params, *, loc=None, ip=None
+    ) -> Tuple[Int32, Int32, Int32]:
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        return (cutlass.min(Int32(sm_count), params.total_blocks), params.num_splits, Int32(1))
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._tile_idx += cute.arch.grid_dim()[0]
+        return self.get_current_work()
+
+
+class PersistentZigzagLPTScheduler(SingleTileLPTScheduler):
+    """Causal forward on a persistent grid of min(SMs, tiles) CTAs with a balanced static assignment.
+
+    The work tiles are ordered longest first over the whole problem (Q block descending, then (batch, head)); round r
+    of the grid takes positions [r G, (r + 1) G), and CTA i takes position r G + i on even rounds and r G + G - 1 - i on
+    odd rounds (a boustrophedon), so every CTA gets one tile of each length band and the per-CTA sums of causal
+    tile lengths match to within one tile (the stripe assignment of PersistentLPTScheduler leaves the first CTAs one
+    long tile per round ahead: +12 % makespan in the list-scheduling model; the balanced order measured -5 / -12 %).
+    Each CTA keeps the round index in _tile_idx. Static scheduling only; no L2 head sections."""
+
+    @staticmethod
+    def create(
+        params: SingleTileLPTScheduler.Params, ctx: SchedulerState | None = None, *, loc=None, ip=None
+    ) -> "PersistentZigzagLPTScheduler":
+        assert params.scheduling_mode == SchedulingMode.STATIC
+        assert not params.is_split_kv and params.cluster_shape_m == 1
+        return PersistentZigzagLPTScheduler(params, Int32(0), Int32(0), loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: SingleTileLPTScheduler.Params, *, loc=None, ip=None
+    ) -> Tuple[Int32, Int32, Int32]:
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        return (cutlass.min(Int32(sm_count), params.total_blocks), Int32(1), Int32(1))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
+        grid = cute.arch.grid_dim()[0]
+        cta = cute.arch.block_idx()[0]
+        rnd = self._tile_idx
+        slot = cta
+        if rnd % 2 == 1:
+            slot = grid - 1 - cta
+        pos = rnd * grid + slot
+        num_hb = params.num_head * params.num_batch
+        level = pos // num_hb
+        bidhb = pos - level * num_hb
+        batch_idx, head_idx = divmod(bidhb, params.num_head_divmod)
+        block = params.num_block - 1 - level
+        is_valid = pos < params.total_blocks
+        return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid)
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._tile_idx += 1
+        return self.get_current_work()
+
+
+class VarlenWorkListScheduler:
+    """Aligned varlen (lp_varlen.LPDocs.aligned_from) from a precomputed work list, O(1) per tile.
+
+    mWork (int32, 1-D): [n_entries, l2_heads, a_0, b_0, a_1, b_1, ...], built on the GPU (lp_varlen.varlen_worklist, no
+    host sync). Entry e is one row of work tiles over the heads: (a, b) = (document, 256-row Q block) for the forward,
+    (0, 128-key tile) for the backward. The entries are sorted longest first (document work order; within a document
+    the longest causal tile first). Position pos -> (entry, head): head sections of l2_heads heads (the last one may
+    be narrower), section-major, then the entry, then the head inside the section (consecutive positions share the
+    entry's K / V rows and, under GQA, the kv head), so a section's K / V stay in L2 (FA4 SingleTileLPTScheduler head
+    swizzle / FA3 L2 sections; one section when every head fits). Returns WorkTileInfo((b, head, a, 0)).
+
+    persistent=True (forward): grid = min(SMs, max_tiles) CTAs; round r of the grid takes positions [r G, (r + 1) G),
+    CTA i position r G + i on even rounds and r G + G - 1 - i on odd rounds (PersistentZigzagLPTScheduler's
+    boustrophedon). persistent=False (backward): one CTA per position (grid = max_tiles, the host upper bound),
+    pos = blockIdx.x; positions past n_entries * heads are invalid (the CTA exits)."""
+
+    @dataclass
+    class Params(ParamsBase):
+        mWork: cute.Tensor
+        num_head: Int32
+        max_tiles: Int32
+        persistent: cutlass.Constexpr[bool] = True
+        # non-persistent: the decoded position table at mWork[pos_off + pos] ((b << 10) | head, -1 = no tile)
+        pos_off: Int32 = 0
+        pos_table: cutlass.Constexpr[bool] = False
+        # (persistent) the grid's CTA count instead of the SMs (sfd backward: 5 / 4 ceil(T / 128) x heads, so one CTA takes
+        # one position unless the list is longer -- the hardware's dynamic CTA order balances the work as one CTA per
+        # position does, and no CTA is launched for the static bound's empty positions)
+        grid_cap: Optional[Int32] = None
+        # (sfd backward overflow launch, persistent) the positions start here: the main launch's grid took [0, pos_base)
+        pos_base: Optional[Int32] = None
+
+    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def create(params: Params, ctx: SchedulerState | None = None, *, loc=None, ip=None) -> "VarlenWorkListScheduler":
+        if const_expr(params.persistent):
+            return VarlenWorkListScheduler(params, Int32(0), loc=loc, ip=ip)
+        return VarlenWorkListScheduler(params, cute.arch.block_idx()[0], loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(params: Params, *, loc=None, ip=None) -> Tuple[Int32, Int32, Int32]:
+        if const_expr(params.persistent):
+            hardware_info = cutlass.utils.HardwareInfo()
+            sm_count = hardware_info.get_device_multiprocessor_count()
+            if const_expr(params.grid_cap is not None):
+                return (cutlass.min(params.grid_cap, params.max_tiles), Int32(1), Int32(1))
+            return (cutlass.min(Int32(sm_count), params.max_tiles), Int32(1), Int32(1))
+        if const_expr(params.grid_cap is not None):   # (one position per CTA over the first grid_cap positions)
+            return (cutlass.min(params.grid_cap, params.max_tiles), Int32(1), Int32(1))
+        return (params.max_tiles, Int32(1), Int32(1))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
+        pos = self._tile_idx
+        if const_expr(params.persistent):
+            grid = cute.arch.grid_dim()[0]
+            cta = cute.arch.block_idx()[0]
+            slot = cta
+            if self._tile_idx % 2 == 1:
+                slot = grid - 1 - cta
+            pos = self._tile_idx * grid + slot
+            if const_expr(params.pos_base is not None):
+                pos = pos + params.pos_base
+        if const_expr(params.pos_table):
+            v = Int32(-1)
+            if pos < params.max_tiles:
+                v = params.mWork[params.pos_off + pos]
+            return WorkTileInfo((Int32(v >> 10), Int32(v & 1023), Int32(0), Int32(0)), v >= 0)
+        n_ent = params.mWork[0]
+        sec = params.mWork[1]
+        is_valid = pos < n_ent * params.num_head
+        a = Int32(0)
+        b = Int32(0)
+        head = Int32(0)
+        if is_valid:
+            sec_tiles = n_ent * sec
+            s = pos // sec_tiles
+            within = pos - s * sec_tiles
+            width = sec
+            n_full = params.num_head // sec
+            if s >= n_full:
+                width = params.num_head - n_full * sec
+            e = within // width
+            head = s * sec + within - e * width
+            a = params.mWork[2 + 2 * e]
+            b = params.mWork[3 + 2 * e]
+        return WorkTileInfo((Int32(b), Int32(head), Int32(a), Int32(0)), is_valid)
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        if const_expr(self.params.persistent):
+            self._tile_idx += 1
+        else:
+            self._tile_idx = self.params.max_tiles
+        return self.get_current_work()
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._tile_idx]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(*obj_list, loc=self._loc)
+
+
+class VarlenWorkListDynScheduler:
+    """VarlenWorkListScheduler's work list and position decode with DYNAMIC claiming (opt-in
+    HostSpec.varlen_fwd_sched): positions are taken in list order (longest first) by whichever CTA frees up first,
+    instead of the static boustrophedon deal. Scheduling only: every position runs on exactly one CTA with the same
+    per-tile code, so O / LSE are bitwise the static scheduler's.
+
+    One producer warp per CTA (`produce`) claims the CTA's next position and publishes it through a ring of `stages`
+    SMEM words with full / empty mbarriers; every role warp (consumer) reads the ring in order (advance_to_next_work).
+    The CTA's first position is blockIdx.x. The producer publishes positions until the first invalid one (which every
+    consumer reads and exits on).
+
+    mode 'atomic': grid = min(SMs, max_tiles); next position = grid + atomicAdd(mWork[ctr_off], 1). Each CTA, after its
+    last (invalid) claim, adds 1 to mWork[ctr_off + 1]; the CTA that takes it to grid resets both words to 0 (every
+    CTA has made its last claim by then), so the counters are 0 again at the end of every launch with no torch op
+    (lp_varlen.varlen_worklist zeroes them once when it builds the list).
+    mode 'clc': grid = max_tiles (an upper bound of the list's positions: (n_max + b) / 2 entries x heads); next
+    position = the blockIdx.x of a CTA cancelled with clusterlaunchcontrol.try_cancel (Cluster Launch Control: the
+    hardware hands out the not-yet-launched CTAs, in launch order). A cancelled position past the list's end is
+    skipped (the producer cancels again: draining the empty tail without launching it); a failed cancel (nothing left
+    to cancel) ends the CTA."""
+
+    @dataclass
+    class Params(ParamsBase):
+        mWork: cute.Tensor
+        num_head: Int32
+        max_tiles: Int32
+        ctr_off: Int32
+        mode: cutlass.Constexpr[str] = "atomic"
+        stages: cutlass.Constexpr[int] = 2
+        n_consumer_warps: cutlass.Constexpr[int] = 1
+        # jit claim: the LOAD warp claims tile k + 1 itself when it has issued tile k's last K / V load (its
+        # prefetch_next_work), instead of a producer warp claiming as soon as a ring slot frees; the claim then lags
+        # the CTA's real free time by ~ the K / V ring depth instead of ~ one tile
+        jit: cutlass.Constexpr[bool] = False
+
+    def __init__(self, params: Params, ring_ptr, pos: Int32, stage: Int32, phase: Int32, clc_phase: Int32 = None,
+                 producer: bool = False, *, loc=None, ip=None):
+        self.params = params
+        self._producer = producer
+        self._clc_phase = Int32(0) if clc_phase is None else clc_phase
+        # ring_ptr: SMEM Int64 words: [full x stages, empty x stages, clc mbarrier, pad, clc response (2), pos x stages]
+        self._ring = ring_ptr
+        self._pos = pos
+        self._stage = stage
+        self._phase = phase
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def ring_words(stages: int) -> int:
+        return 2 * stages + 4 + stages
+
+    @staticmethod
+    @cute.jit
+    def init_barriers(params: Params, ring_ptr):
+        for i in cutlass.range_constexpr(params.stages):
+            cute.arch.mbarrier_init(ring_ptr + i, 1)
+            cute.arch.mbarrier_init(ring_ptr + params.stages + i, params.n_consumer_warps)
+        cute.arch.mbarrier_init(ring_ptr + 2 * params.stages, 1)
+
+    @staticmethod
+    def create(params: Params, ring_ptr, ctx: SchedulerState | None = None, *, producer: bool = False, loc=None,
+               ip=None) -> "VarlenWorkListDynScheduler":
+        return VarlenWorkListDynScheduler(params, ring_ptr, cute.arch.block_idx()[0], Int32(0), Int32(0), Int32(0),
+                                          producer, loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(params: Params, *, loc=None, ip=None) -> Tuple[Int32, Int32, Int32]:
+        if const_expr(params.mode == "clc"):
+            return (params.max_tiles, Int32(1), Int32(1))
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        return (cutlass.min(Int32(sm_count), params.max_tiles), Int32(1), Int32(1))
+
+    def _pos_tensor(self):
+        p = cute.recast_ptr(self._ring + 2 * self.params.stages + 4, dtype=Int32)
+        return cute.make_tensor(p, cute.make_layout(2 * self.params.stages))
+
+    def _clc_resp_ptr(self):
+        return self._ring + 2 * self.params.stages + 2
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
+        pos = self._pos
+        n_ent = params.mWork[0]
+        sec = params.mWork[1]
+        is_valid = pos < n_ent * params.num_head
+        a = Int32(0)
+        b = Int32(0)
+        head = Int32(0)
+        if is_valid:
+            sec_tiles = n_ent * sec
+            s = pos // sec_tiles
+            within = pos - s * sec_tiles
+            width = sec
+            n_full = params.num_head // sec
+            if s >= n_full:
+                width = params.num_head - n_full * sec
+            e = within // width
+            head = s * sec + within - e * width
+            a = params.mWork[2 + 2 * e]
+            b = params.mWork[3 + 2 * e]
+        return WorkTileInfo((Int32(b), Int32(head), Int32(a), Int32(0)), is_valid)
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    @cute.jit
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        """jit claim, the load warp only: wait for this ring slot to be free, claim, publish (the warp then reads it
+        back through advance_to_next_work like every consumer)."""
+        if const_expr(self.params.jit and self._producer):
+            params = self.params
+            n_valid = params.mWork[0] * params.num_head
+            cute.arch.mbarrier_wait(self._ring + params.stages + self._stage, self._phase ^ 1)
+            pos, self._clc_phase = self._claim(n_valid, self._clc_phase)
+            if cute.arch.lane_idx() == 0:
+                self._pos_tensor()[self._stage] = pos
+                cute.arch.mbarrier_arrive(self._ring + self._stage)
+
+    @cute.jit
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        """Consumer: the next ring entry (all lanes wait; lane 0 reads it, broadcasts, then frees the slot)."""
+        stages = self.params.stages
+        cute.arch.mbarrier_wait(self._ring + self._stage, self._phase)
+        v = Int32(0)
+        if cute.arch.lane_idx() == 0:
+            v = self._pos_tensor()[self._stage]
+        v = cute.arch.shuffle_sync(v, 0)
+        if cute.arch.lane_idx() == 0:
+            cute.arch.mbarrier_arrive(self._ring + stages + self._stage)
+        self._pos = v
+        nxt = self._stage + 1
+        wrap = Int32(nxt >= stages)
+        self._stage = nxt - wrap * stages
+        self._phase = self._phase ^ wrap
+        return self.get_current_work()
+
+    @cute.jit
+    def _claim(self, n_valid: Int32, clc_phase: Int32):
+        """The producer's next position (all lanes get it) and the CLC mbarrier phase after it."""
+        params = self.params
+        pos = Int32(0)
+        if const_expr(params.mode == "atomic"):
+            t = Int32(0)
+            if cute.arch.lane_idx() == 0:
+                t = utils.atomic_add_i32(1, params.mWork.iterator + params.ctr_off)
+            pos = cute.arch.grid_dim()[0] + cute.arch.shuffle_sync(t, 0)
+        else:
+            mbar = self._ring + 2 * params.stages
+            resp = self._clc_resp_ptr()
+            searching = Boolean(True)
+            while searching:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(mbar, 16)
+                    cute.arch.issue_clc_query(mbar, resp, multicast=False)
+                cute.arch.mbarrier_wait(mbar, clc_phase)
+                clc_phase ^= 1
+                x, _y, _z, ok = cute.arch.clc_response(resp)
+                # the response was read through the generic proxy; order it before the next async-proxy write
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.sync_warp()
+                pos = x
+                if ok == 0:
+                    pos = n_valid   # nothing left to cancel: the end
+                    searching = Boolean(False)
+                elif x < n_valid:
+                    searching = Boolean(False)
+        return pos, clc_phase
+
+    @cute.jit
+    def produce(self):
+        """The producer warp's loop: claim, wait for a free slot, publish; stops after publishing the first invalid
+        position (the CTA's first position, blockIdx.x, is not published: every warp starts from it)."""
+        params = self.params
+        stages = params.stages
+        n_valid = params.mWork[0] * params.num_head
+        pos = self._pos
+        stage = Int32(0)
+        phase = Int32(1)
+        clc_phase = Int32(0)
+        while pos < n_valid:
+            # a free slot first, then the claim: the CTA holds at most `stages` claimed positions ahead of its
+            # slowest role warp
+            cute.arch.mbarrier_wait(self._ring + stages + stage, phase)
+            pos, clc_phase = self._claim(n_valid, clc_phase)
+            if cute.arch.lane_idx() == 0:
+                self._pos_tensor()[stage] = pos
+                cute.arch.mbarrier_arrive(self._ring + stage)
+            nxt = stage + 1
+            wrap = Int32(nxt >= stages)
+            stage = nxt - wrap * stages
+            phase = phase ^ wrap
+        self._claims_done()
+
+    @cute.jit
+    def _claims_done(self):
+        """atomic: this CTA's claims are over; the last CTA to get here resets the counters for the next launch."""
+        params = self.params
+        if const_expr(params.mode == "atomic"):
+            if cute.arch.lane_idx() == 0:
+                cute.arch.fence_acq_rel_gpu()
+                done = utils.atomic_add_i32(1, params.mWork.iterator + (params.ctr_off + 1))
+                if done == cute.arch.grid_dim()[0] - 1:
+                    cute.arch.fence_acq_rel_gpu()
+                    params.mWork[params.ctr_off] = Int32(0)
+                    params.mWork[params.ctr_off + 1] = Int32(0)
+
+    def producer_tail(self, *, loc=None, ip=None):
+        """jit claim: the load warp calls it once after its loop (its last claim was the invalid one, or it had none)."""
+        if const_expr(self.params.jit and self._producer):
+            self._claims_done()
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._ring, self._pos, self._stage, self._phase, self._clc_phase]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._ring, self._pos, self._stage, self._phase, self._clc_phase],
+                                self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(*obj_list, self._producer, loc=self._loc)
 
 
 class SingleTileLPTBwdScheduler:
@@ -2152,3 +2602,121 @@ def make_sm100_thread_cooperative_group(size: int):
 
 
 SM100_TMEM_CAPACITY_COLUMNS = 512
+
+
+class PackedOverflowScheduler:
+    """(spd4) The overflow launch of the packed all-FP4 backward (flash_bwd_sm100_fp4q codes_packed) on a capped grid:
+    the main launch takes key tiles [0, cap) x heads one per CTA (SingleTileScheduler, grid cap x heads); this launch
+    takes the rest, [cap, ntiles) x heads with ntiles the maps' DEVICE key tile count, persistent over a grid of
+    min(SMs, (tile_bound - cap) x heads) CTAs (CTA i: positions i, i + G, ...; position p -> head p // (ntiles - cap),
+    key tile cap + p % (ntiles - cap): consecutive positions are consecutive key tiles of one head, as the main grid's
+    blockIdx.x). Its CTAs exit at once when ntiles <= cap. Returns WorkTileInfo((n_block, head, 0, 0))."""
+
+    @dataclass
+    class Params(ParamsBase):
+        mNTiles: cute.Tensor   # (1,) int32: the key side's device tile count
+        num_head: Int32
+        cap: Int32
+        max_tiles: Int32       # (tile_bound - cap) x heads: the static bound of the positions
+
+    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def create(params: Params, ctx: SchedulerState | None = None, *, loc=None, ip=None) -> "PackedOverflowScheduler":
+        return PackedOverflowScheduler(params, Int32(0), loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(params: Params, *, loc=None, ip=None) -> Tuple[Int32, Int32, Int32]:
+        sm_count = HardwareInfo().get_device_multiprocessor_count()
+        return (cutlass.max(cutlass.min(Int32(sm_count), params.max_tiles), Int32(1)), Int32(1), Int32(1))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
+        pos = self._tile_idx * cute.arch.grid_dim()[0] + cute.arch.block_idx()[0]
+        per = cutlass.max(params.mNTiles[0] - params.cap, Int32(0))
+        is_valid = pos < per * params.num_head
+        n_block = Int32(0)
+        head = Int32(0)
+        if is_valid:
+            head = pos // per
+            n_block = params.cap + pos - head * per
+        return WorkTileInfo((n_block, head, Int32(0), Int32(0)), is_valid)
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._tile_idx += 1
+        return self.get_current_work()
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._tile_idx]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(*obj_list, loc=self._loc)
+
+
+class FixedTileScheduler:
+    """(spd4) One given work tile (n_block, head, batch, split), once: the per-tile role calls inside the packed
+    backward's overflow loop (each tile runs the one-tile code on freshly initialised barriers)."""
+
+    @dataclass
+    class Params(ParamsBase):
+        n_block: Int32
+        head: Int32
+
+    def __init__(self, params: Params, *, loc=None, ip=None):
+        self.params = params
+        self._is_first_block = True
+        self._loc = loc
+
+    @staticmethod
+    def create(params: Params, ctx: SchedulerState | None = None, *, loc=None, ip=None) -> "FixedTileScheduler":
+        return FixedTileScheduler(params, loc=loc, ip=ip)
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        return WorkTileInfo((self.params.n_block, self.params.head, Int32(0), Int32(0)), self._is_first_block)
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._is_first_block = False
+        return self.get_current_work()
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values = cutlass.extract_mlir_values(self.params)
+        self._n_values = len(values)
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        s = FixedTileScheduler(cutlass.new_from_mlir_values(self.params, values), loc=self._loc)
+        s._is_first_block = self._is_first_block
+        return s

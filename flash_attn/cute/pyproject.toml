@@ -44,7 +44,7 @@ Homepage = "https://github.com/Dao-AILab/flash-attention"
 Repository = "https://github.com/Dao-AILab/flash-attention"
 
 [tool.setuptools]
-packages = ["flash_attn.cute"]
+packages = ["flash_attn.cute", "flash_attn.cute.lowprec", "flash_attn.cute.quant"]
 package-dir = {"flash_attn.cute" = "."}
 
 [tool.setuptools_scm]

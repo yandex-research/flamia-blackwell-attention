@@ -114,13 +114,34 @@ _TUNING_CONFIG = {
     (True, False, 256, False): {"ex2_emu_freq": 14, "ex2_emu_res": 6, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
     (True, True, 256, False): {"ex2_emu_freq": 14, "ex2_emu_res": 6, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
 }
+# FP8 hd128: ex2_emu_freq = 12 everywhere.
+#
+# The forward is MUFU/ex2-bound, not tensor-core bound: FP8 reaches only ~31 % of its dense MMA
+# peak where BF16 reaches ~64 % of its own, i.e. both land at the same absolute rate, which is
+# what a shared non-MMA bottleneck looks like. That is why FP8's 2x MMA throughput buys so
+# little by itself, and why this knob -- how often exp2 is emulated on the FMA pipe instead of
+# issued to MUFU -- is the one that actually moves the forward.
+#
+# The previous values were 10 non-causal (byte-for-byte BF16's entry, never swept for FP8) and 8
+# causal. Sweeping 4..32 puts the FP8 optimum at 12 at every shape measured, with 8 and 10 both
+# on the wrong side of it. Against the previous defaults, 3-run medians on an idle B200:
+#
+#   b4 s4096  h16    MHA   nc +8.1 %   c +2.8 %
+#   b1 s32768 h16    MHA   nc +9.6 %   c +1.6 %
+#   b2 s8192  h16/4  GQA   nc +8.4 %   c +4.1 %
+#
+# Wins or ties all six gates, accuracy unchanged to every printed digit (output cosine against
+# an fp32 reference over the dequantised operands: 0.999689 -> 0.999689 nc, 0.999794 ->
+# 0.999794 c). This also turns non-causal s4096 from 0.96x BF16 into a tie, which was the
+# anomaly that prompted the sweep.
+#
+# The 2-CTA causal key had no FP8 entry, and the bf16 table has no hd128 causal 2-CTA row
+# either, so that configuration ran on the built-in default; it is spelled out now.
 _FP8_TUNING_CONFIG = {
-    (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
-    # Causal hd128 FP8 previously inherited bf16's freq=16. FP8 fwd is MUFU/ex2-bound, so a more
-    # aggressive emulation freq=8 offloads more exp from MUFU: +3.4%(4k)..+5.5%(16k) on B200,
-    # MHA & GQA, accuracy-neutral (3-run validated, locked clocks). freq=8 would regress non-causal
-    # (0.94x), hence keyed on is_causal=True only.
-    (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
+    (True, False, 128, False): {'ex2_emu_freq': 12, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
+    (True, True, 128, False): {'ex2_emu_freq': 12, 'ex2_emu_start_frg': 1},
+    (False, False, 128, False): {'ex2_emu_freq': 12, 'ex2_emu_start_frg': 1},
+    (False, True, 128, False): {'ex2_emu_freq': 12, 'ex2_emu_start_frg': 1},
 }
 _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
@@ -135,7 +156,12 @@ class DescaleTensors(NamedTuple):
     v_descale: Optional[cute.Tensor] = None
 
     def __new_from_mlir_values__(self, values):
-        return DescaleTensors(*((*values, None, None, None)[:3]))
+        # One value per tensor that is present, in field order; absent fields stay None. The old
+        # `DescaleTensors(*((*values, None, None, None)[:3]))` packed the values from the left, so a v_descale given
+        # without q_descale / k_descale landed in the q (or k) slot: the scores were multiplied by s_v and O was left
+        # unscaled (O cosine 0.62, `upstream-fp8-v-descale-wrong`).
+        it = iter(values)
+        return DescaleTensors(*(None if f is None else next(it) for f in self))
 
 
 class FlashAttentionForwardSm100:

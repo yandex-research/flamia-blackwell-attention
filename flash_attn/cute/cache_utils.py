@@ -146,22 +146,51 @@ class FileLock:
             self._fd = None
 
 
+@lru_cache(maxsize=None)
+def _device_arch_of(index: int) -> str:
+    import torch
+    major, minor = torch.cuda.get_device_capability(index)
+    return f"sm{major}{minor}"
+
+
+def target_arch() -> str:
+    """The architecture a kernel compiled now targets: FLASH_ATTENTION_ARCH (CPU-only compiles), else the current CUDA
+    device's capability, else CUTE_DSL_ARCH, else "unknown". Part of every JIT cache key: an sm_100a binary and an
+    sm_103a one (B200 / B300) are different kernels -- not only different ISA targets, also different SM103 rules
+    (tcgen05.ld.red, the exp2 emulation shares) baked in at trace time."""
+    override = os.environ.get("FLASH_ATTENTION_ARCH")
+    if override:
+        return "sm" + override.lower().removeprefix("sm_").removeprefix("sm").rstrip("afl")
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return _device_arch_of(torch.cuda.current_device())
+    except Exception:  # noqa: BLE001 (no CUDA runtime: CPU-only compilation)
+        pass
+    dsl = os.environ.get("CUTE_DSL_ARCH")
+    return "sm" + dsl.lower().removeprefix("sm_").rstrip("afl") if dsl else "unknown"
+
+
 class JITCache:
     """
-    In-memory cache for compiled functions.
+    In-memory cache for compiled functions. Keys are qualified by target_arch().
     """
 
     def __init__(self):
         self.cache: dict[CompileKeyType, CallableFunction] = {}
 
+    @staticmethod
+    def _qual(key: CompileKeyType) -> CompileKeyType:
+        return (key, target_arch())
+
     def __setitem__(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
-        self.cache[key] = fn
+        self.cache[self._qual(key)] = fn
 
     def __getitem__(self, key: CompileKeyType) -> CallableFunction:
-        return self.cache[key]
+        return self.cache[self._qual(key)]
 
     def __contains__(self, key: CompileKeyType) -> bool:
-        return key in self.cache
+        return self._qual(key) in self.cache
 
     def clear(self) -> None:
         """
@@ -246,7 +275,7 @@ class JITPersistentCache(JITCache):
             fa_log(1, f"Successfully exported compiled function to disk: {obj_path}")
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
-        return hashlib.sha256(pickle.dumps(key)).hexdigest()
+        return hashlib.sha256(pickle.dumps(self._qual(key))).hexdigest()
 
     def _lock_path(self, sha256_hex: str) -> Path:
         return self.cache_path / f"{sha256_hex}.lock"

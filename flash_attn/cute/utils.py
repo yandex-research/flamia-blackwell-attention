@@ -4,6 +4,7 @@ import math
 import hashlib
 import inspect
 import os
+import re
 from functools import partial
 from typing import Type, Callable, Optional, Tuple, overload, NamedTuple
 
@@ -1044,3 +1045,87 @@ def as_shhb_tensor(
             ),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Low-precision (FP4/FP8) additions.
+# Helpers the block-scaled NVFP4/MXFP4 attention kernels need that upstream does
+# not define. Kept additive so upstream utils.py fixes apply unchanged.
+# ---------------------------------------------------------------------------
+# Packed-f32x2 arithmetic with an explicit round-to-nearest mode. The low-precision kernels call
+# these through `utils.` so the rounding mode is pinned in one place; cutlass < 4.5 wanted the nvvm
+# enum, >= 4.5 wants the string.
+_RND_RN = "rn" if tuple(int(x) for x in cutlass.__version__.split(".")[:2]) >= (4, 5) else nvvm.RoundingModeKind.RN
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=_RND_RN)
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=_RND_RN)
+def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
+    """Extract swizzle parameters from a pointer's swizzle_type.
+
+    The swizzle_type string has the form '!cute.swizzle<"S<b,m,s>">' where
+    b, m, s are the swizzle parameters (bits, base, shift).
+
+    Returns:
+        A cute.Swizzle object constructed from the extracted parameters
+
+    Raises:
+        ValueError: If the swizzle_type string cannot be parsed
+    """
+    swizzle_str = str(ptr.type.swizzle_type)
+    match = re.search(r'S<(\d+),(\d+),(\d+)>', swizzle_str)
+    if match:
+        b, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        return cute.make_swizzle(b, m, s)
+    else:
+        raise ValueError(f"Could not parse swizzle_type: {swizzle_str}")
+
+
+def transpose_view(a: cute.Tensor) -> cute.Tensor:
+    """Transpose the first two dimensions of a tensor on smem."""
+    shape = (a.shape[1], a.shape[0], *a.shape[2:])
+    order = (1, 0, *range(2, cute.rank(a)))
+    return cute.composition(a, cute.make_ordered_layout(shape, order=order))
+
+
+@dsl_user_op
+def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "lg2.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def pow2_log2_rcp(x: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """(log2 x, 1 / x) of x = 0 or a normal power of two, by integer ops on the bits (no MUFU): the exponent field
+    minus 127, and (254 << 23) - bits. x = 0 gives (-inf, 0). The token-block factors 2^(e - 127), e in 1..254, or 0."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Float32(x).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b32 b, e, ub;\n\t"
+        ".reg .f32 lf;\n\t"
+        ".reg .pred z;\n\t"
+        "mov.b32 b, $2;\n\t"
+        "setp.eq.u32 z, b, 0;\n\t"
+        "shr.u32 e, b, 23;\n\t"
+        "sub.s32 e, e, 127;\n\t"
+        "cvt.rn.f32.s32 lf, e;\n\t"
+        "selp.f32 $0, 0fFF800000, lf, z;\n\t"
+        "sub.s32 ub, 2130706432, b;\n\t"
+        "selp.b32 ub, 0, ub, z;\n\t"
+        "mov.b32 $1, ub;\n\t"
+        "}\n",
+        "=f,=f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (Float32(llvm.extractvalue(T.f32(), out, [0], loc=loc, ip=ip)),
+            Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)))

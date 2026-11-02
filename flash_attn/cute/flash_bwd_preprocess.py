@@ -49,6 +49,7 @@ class FlashAttentionBackwardPreprocess:
         qhead_per_kvhead: int = 1,
         nheads_kv: int = 1,
         hdim_multiple_of: int = 32,
+        dqaccum_dtype: Type[cutlass.Numeric] = Float32,  # the zeroed dQ accumulator's type (f16 for the low-precision backward)
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -63,6 +64,7 @@ class FlashAttentionBackwardPreprocess:
         :param hdim_multiple_of: accumulator alignment shared with the main backward kernel.
         """
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
+        self.dqaccum_dtype = dqaccum_dtype
         self.dtype = dtype
         self.tile_m = tile_m
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -123,12 +125,12 @@ class FlashAttentionBackwardPreprocess:
             self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )
         universal_copy_bits = 128
-        num_copy_elems_dQaccum = universal_copy_bits // Float32.width
+        num_copy_elems_dQaccum = universal_copy_bits // self.dqaccum_dtype.width
         assert (
             self.tile_m * self.head_dim_padded // num_copy_elems_dQaccum
         ) % self.num_threads == 0
         self.gmem_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
-            Float32, self.num_threads, num_copy_elems_dQaccum
+            self.dqaccum_dtype, self.num_threads, num_copy_elems_dQaccum
         )
 
     @cute.jit
@@ -162,8 +164,8 @@ class FlashAttentionBackwardPreprocess:
             assert self.nheads_major is False
             assert self.pack_gqa is False
             assert self.use_padded_offsets is True
-            if const_expr(mdQaccum.element_type not in [Float32]):
-                raise TypeError("dQaccum tensor must be Float32")
+            if const_expr(mdQaccum.element_type != self.dqaccum_dtype):
+                raise TypeError("dQaccum tensor must be of the constructor's dqaccum_dtype (Float32 by default)")
         if const_expr(mLSE is not None):
             if const_expr(mLSE.element_type not in [Float32]):
                 raise TypeError("LSE tensor must be Float32")
