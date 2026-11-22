@@ -106,10 +106,10 @@ class LPDocs:
         ok = torch.empty(1, dtype=torch.int32, device=dev)
         n_prog = max(triton.cdiv(total_q, _PREP_ROWS), triton.cdiv(tiles_k, _PREP_COLS), triton.cdiv(b + 1, _PREP_COLS))
         steps = max(1, int(b).bit_length() + 1)
-        _aligned_prep[(n_prog,)](cu_q, cu_k, used_q, used_k, tab, ndoc_k, ndoc_q, rend, q_valid, ok, b, tiles_q, tiles_k,
-                                 total_q, total_k, align, steps, ROWS=_PREP_ROWS, COLS=_PREP_COLS,
-                                 **({"REQ_KEYS": int(require_keys), "max_k": doc_key_len_of(max_seqlen_k, total_k)}
-                                    if require_keys else {}))
+        _launch(_aligned_prep, (n_prog,), cu_q, cu_k, used_q, used_k, tab, ndoc_k, ndoc_q, rend, q_valid, ok, b,
+                tiles_q, tiles_k, total_q, total_k, align, steps, ROWS=_PREP_ROWS, COLS=_PREP_COLS,
+                REQ_KEYS=int(require_keys),
+                max_k=doc_key_len_of(max_seqlen_k, total_k) if require_keys else 0)   # (the kernel's defaults)
         # starts % align == 0, 0 <= seqused <= slot length, the slots inside the allocation: checked on the GPU (a
         # device-side assert; no host read). The kernels run after it on the stream.
         torch._assert_async(ok, "aligned varlen: cu_seqlens starts must be multiples of the alignment (128; 256 with "
@@ -244,6 +244,20 @@ class LPDocs:
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
+
+def _launch(kernel, grid, *args, **kwargs):
+    """kernel[grid](*args, **kwargs). While a torch dispatch mode is active -- the fake / functional / proxy tensors of
+    torch.compile, which traces this glue around the lowbit_attn op (lowprec.api's traced entries) -- the launch goes
+    through torch.library.wrap_triton, so it becomes a graph node (a raw launch would read a fake tensor's data
+    pointer). Eager calls launch directly: wrap_triton's dispatch costs ~1 ms per call in eager mode.
+    Pass every argument explicitly: Inductor does not fill a user Triton kernel's omitted non-constexpr defaults (its
+    recompile of the kernel fails with "'NoneType' object has no attribute '_unflatten_ir'")."""
+    from torch.utils._python_dispatch import is_in_torch_dispatch_mode
+    if is_in_torch_dispatch_mode():
+        return torch.library.wrap_triton(kernel)[grid](*args, **kwargs)
+    return kernel[grid](*args, **kwargs)
+
+
 _PREP_ROWS = 1024   # query rows per program (q_valid; their 8 tiles' row_end_q)
 _PREP_COLS = 1024   # key tiles / table columns per program
 
@@ -370,7 +384,7 @@ def row_gather(x: torch.Tensor, idx: torch.Tensor, rows: int) -> torch.Tensor:
         C *= int(n)
     out = torch.empty((rows,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device)
     BLOCK = 2048 if C >= 2048 else triton.next_power_of_2(C)
-    _row_gather[(rows, triton.cdiv(C, BLOCK))](x, idx, out, C, BLOCK=BLOCK)
+    _launch(_row_gather, (rows, triton.cdiv(C, BLOCK)), x, idx, out, C, BLOCK=BLOCK)
     return out
 
 

@@ -21,11 +21,11 @@ Schema (both ops; ``fp8`` and ``fp4`` share the implementation, the plan picks t
   handle of their (interned) non-tensor structure; ``docs_id = -1`` without documents. The masks are rebuilt in the
   op from the plan (causal / window / softcap) and the documents, exactly as the public path builds them.
 - ``state``: everything the route's backward needs that is not an input or ``out`` / ``lse``: one tensor per
-  distinct storage the route's saved state (``_routes.Saved``) holds (the first saved tensor on it; the others are
-  views of it). The state's structure (which attribute is which view of which storage, every non-tensor value) is
-  recorded once per call signature (``entry``) and must be the same on every later call with that signature: the
-  tensor layout is checked on every call, the non-tensor values on the first ``_FULL_CHECKS`` calls (a mismatch
-  raises).
+  distinct storage the route's saved state (``_routes.Saved``) holds (the whole storage as a uint8 tensor from byte 0,
+  so every output is aligned like an allocation; the saved tensors are views of it). The state's structure (which
+  attribute is which view of which storage, every non-tensor value) is recorded once per call signature (``entry``)
+  and must be the same on every later call with that signature: the tensor layout is checked on every call, the
+  non-tensor values on the first ``_FULL_CHECKS`` calls (a mismatch raises).
   The autograd context saves exactly the inputs, outputs and state tensors the backward reads, so the backward state
   lives in the op's autograd context only: no host sync, nothing on the Python side per call, CUDA-graph safe.
 
@@ -46,10 +46,29 @@ import threading
 from typing import List, Tuple
 
 import torch
+import torch.compiler.config
 
 __all__ = ["OPS", "plan_handle", "op_apply", "flatten_docs", "state_of"]
 
 _LOCK = threading.RLock()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# torch.compile's on-disk caches: forced off in every process that imports this package
+# ---------------------------------------------------------------------------------------------------------------------
+# The ops' `plan` / `docs_id` arguments and the compiled backward's `entry` are process-local integers (registry indices
+# in call order), so one dynamo graph text (`lowbit_attn.fp8(q, k, v, [], 0, -1)`) stands for different plans and
+# saved-state layouts in different processes. Inductor's FX graph cache and AOTAutograd's cache would then hand one
+# process's compiled forward / backward to another: measured, a backward run with another call signature's state layout
+# (dQ NaN, dK / dV garbage, no error), and metadata-assert failures in the forward. Importing this module therefore sets
+# torch.compiler.config.force_disable_caches, the switch both caches consult (torch reads its environment variable
+# TORCHINDUCTOR_FORCE_DISABLE_CACHES itself, with precedence over this assignment: an explicit 0 keeps the caches on,
+# knowingly -- the hazard above applies).
+def _force_disable_compile_caches() -> None:
+    torch.compiler.config.force_disable_caches = True
+
+
+_force_disable_compile_caches()
 
 # ---------------------------------------------------------------------------------------------------------------------
 # registries (process-local, append-only: a compiled graph may hold any handle)
@@ -212,11 +231,22 @@ def _byte_off(t):
     return t.storage_offset() * t.element_size()
 
 
-def _record_state(st, srcs):
+def _whole_storage(t: torch.Tensor) -> torch.Tensor:
+    """A uint8 view of t's entire storage from byte 0 (as aligned as the allocation itself)."""
+    stor = t.untyped_storage()
+    return torch.empty(0, dtype=torch.uint8, device=t.device).set_(stor, 0, (stor.nbytes(),), (1,))
+
+
+def _record_state(st, srcs, prefer=None):
     """Flatten the route's Saved state: every tensor becomes a view (dtype, size, stride, byte offset relative to its
-    source) of an input / output (srcs: [("in", i, t)] + [("out", j, t)]) or of a base: the first saved tensor on each
-    other storage, returned as an op output itself (the other saved tensors on that storage are views of it).
-    Returns (skeleton, views, bases)."""
+    source) of an input / output (srcs: [("in", i, t)] + [("out", j, t)]) or of a base: each other storage WHOLE, as a
+    uint8 tensor from byte 0, returned as an op output itself (every saved tensor on that storage is a view of it).
+    Whole storages, not "the first saved tensor on each storage": that tensor may be a slice at any byte offset (the
+    8-bit per-tensor route saves row_norm2_max[2:3], byte 8), while a custom op's outputs must be as aligned as fresh
+    allocations -- the fake implementation returns fresh tensors and Inductor asserts 16-byte alignment of every output
+    of the op at run time. prefer: the views recorded by the first call of the signature (or None): each saved tensor
+    takes the source that call recorded whenever that source holds it in this call too, so inputs that alias in one call
+    and not in another give one layout. Returns (skeleton, views, bases)."""
     ts: list = []
     sk, _ = _flatten(st, ts, _descend_types())
     by_ptr: dict = {}
@@ -224,7 +254,7 @@ def _record_state(st, srcs):
         if s.untyped_storage().nbytes() > 0:
             by_ptr.setdefault((s.device, s.untyped_storage().data_ptr()), []).append((kind, idx, s))
     bases, views = [], []
-    for t in ts:
+    for j, t in enumerate(ts):
         dev = t.device
         stor = t.untyped_storage()
         if stor.nbytes() == 0:
@@ -233,11 +263,18 @@ def _record_state(st, srcs):
         pk = (dev, stor.data_ptr())
         cands = by_ptr.get(pk)
         if cands is None:
-            cands = by_ptr[pk] = [("base", len(bases), t)]
-            bases.append(t)
-        # inputs sharing one storage (q, k, v slices of one projection, or not, at the same signature): a tensor at an
-        # input's own offset refers to that input, so the recorded layout does not depend on how the inputs alias
-        src = next((c for c in cands if _byte_off(c[2]) == _byte_off(t)), cands[0])
+            base = _whole_storage(t)
+            cands = by_ptr[pk] = [("base", len(bases), base)]
+            bases.append(base)
+        # inputs sharing one storage (q, k, v slices of one projection, or not, at the same signature): a saved tensor
+        # that IS an input refers to that input, else one at an input's own offset to that input, so the recorded layout
+        # does not depend on how the inputs alias. Several inputs can hold the same tensor -- a compiled graph CSEs the
+        # identical q- and k-side document tables of shared cu_seqlens into ONE buffer passed twice -- and then the
+        # signature's recorded choice (prefer) decides among them.
+        held = [c for c in cands if c[2] is t] or [c for c in cands if _byte_off(c[2]) == _byte_off(t)]
+        pv = prefer[j] if prefer is not None and j < len(prefer) else None
+        src = next((c for c in held if pv is not None and (c[0], c[1]) == (pv[0], pv[1])), None) \
+            or (held[0] if held else cands[0])
         kind, idx, s = src
         rel = _byte_off(t) - _byte_off(s)
         views.append((kind, idx, t.dtype, tuple(t.shape), tuple(t.stride()), rel, dev))
@@ -324,8 +361,10 @@ def _fwd_impl(name, q, k, v, docs, plan, docs_id):
     if lse is None:
         lse = torch.empty(0, dtype=torch.float32, device=q.device)
     srcs = [("in", i, t) for i, t in enumerate([q, k, v] + list(docs))] + [("out", 0, out), ("out", 1, lse)]
-    skel, views, bases = _record_state(st, srcs)
     key = _sig_key(name, plan, docs_id, q, k, v, docs)
+    with _LOCK:
+        e0 = _ENTRY_ID.get(key)
+    skel, views, bases = _record_state(st, srcs, None if e0 is None else _ENTRIES[e0].views)
     with _LOCK:
         e = _ENTRY_ID.get(key)
         if e is None:

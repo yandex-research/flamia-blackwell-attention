@@ -358,15 +358,35 @@ y = checkpoint(block, x, use_reentrant=False, context_fn=partial(create_selectiv
 ```
 
 The saved outputs are the attention output, its LSE and the state the backward reads (the same tensors the eager
-autograd node keeps); the forward kernel then runs once per step. `torch.compile` traces the ops through their fake
-implementation; a varlen call (document tables) must have run once eagerly with the same shapes first. The op is the
-library's autograd node: the varlen repacking around it stays ordinary torch ops. Not through the op (the previous
-`autograd.Function` path, same results): `score_mod` / `score_mod_bwd` / `mask_mod` / `aux_tensors`, and
-pre-quantised inputs (`q_quantized` / `k_quantized` / `q_scale_fused`, `q_descale` / `k_descale` / `v_descale` /
-`grad_proxies`). The op arguments name the resolved plan by a process-local integer handle, so a traced graph is
-not portable to another process; the op's saved-state outputs follow the library's internals, which inductor's
-on-disk cache does not key on: after upgrading the library, clear that cache (a stale entry fails its metadata
-assert, it does not run silently).
+autograd node keeps); the forward kernel then runs once per step. The op is the library's autograd node: the varlen
+repacking around it stays ordinary torch ops. Not through the op (the previous `autograd.Function` path, same
+results): `score_mod` / `score_mod_bwd` / `mask_mod` / `aux_tensors`, and pre-quantised inputs (`q_quantized` /
+`k_quantized` / `q_scale_fused`, `q_descale` / `k_descale` / `v_descale` / `grad_proxies`).
+
+`torch.compile`, `fullgraph=True` included: every call that goes through the op (batched, ragged, varlen aligned or
+repacked, `seqused_k`, window / softcap, any options; `doc_maps` excepted) reaches dynamo as ONE opaque call
+(`torch.compiler.nonstrict_trace`): the plan resolution runs as plain Python while AOTAutograd traces the call with
+fake tensors, the varlen glue and the op (through its fake implementation) become graph nodes, and the backward is the
+op's registered autograd formula. The compiled call runs the same kernels on the same operands: O, LSE and, with
+`deterministic=True`, the gradients are bitwise the eager call's.
+
+```python
+model = torch.compile(model, fullgraph=True, dynamic=False)   # the attention is one node of the model's graph
+```
+
+- The other call forms (`score_mod` / `mask_mod` / `aux_tensors`, pre-quantised inputs, `doc_maps`) compile with graph
+  breaks around the attention call (the default `fullgraph=False`); `fullgraph=True` refuses them.
+- Static shapes: the plan and the op's fake implementation key on concrete shapes. Pass `dynamic=False` when the
+  shapes change between calls (one graph per shape); the automatic dynamic-shape recompile is not supported.
+- A call with document tables (varlen, `seqused_k`, ragged lengths) must have run once eagerly with the same shapes
+  before it is compiled (the fake implementation reads the saved-state layout the first real call records).
+- Importing `flash_attn.cute.lowprec` disables torch.compile's on-disk caches for the process
+  (`torch.compiler.config.force_disable_caches = True`, the switch of `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1`): the op
+  arguments name the resolved plan, the document tables and the
+  backward's state layout by process-local integers, so one graph text stands for different plans in different
+  processes, and a cache entry compiled by one process can run in another with another call's state layout (measured:
+  wrong gradients without an error). An explicit `TORCHINDUCTOR_FORCE_DISABLE_CACHES=0` in the environment keeps the
+  caches on, with that hazard.
 
 ### See what a call will run
 
@@ -404,7 +424,7 @@ the resolved value of every `"auto"` for a concrete call (`plan.log()`).
 | `seqused_k` | `None` | int32 `(b,)` / `(n_docs,)` | without `cu_seqlens_*`: number of used keys per batch row; with them (and `seqused_q`): each document's true key length |
 | `deterministic` | `False` | `True` | bitwise-reproducible dQ (fixed summation order); not on `backward="fp4"` |
 | `return_lse` | `False` | `True` | also return the log-sum-exp `(b, h, s_q)` float32 (`(h, total_q)` under varlen; aligned: padding rows unspecified), not differentiable |
-| `qk_hadamard` | `None` = **on** wherever it can run (d = 128, s % 128 = 0, not `token_local`, not the all-4-bit route), with a log line where it falls back | `True` (required; refused where it cannot run), `False` (off) | random-sign Hadamard rotation of Q and K along d, fused into the quantisers |
+| `qk_hadamard` | `None` = **on** wherever it can run (d = 128, any length -- `s % 128 != 0` runs as documents, where it runs too -- not `token_local`, not the all-4-bit route), with a log line where it falls back | `True` (required; refused where it cannot run), `False` (off) | random-sign Hadamard rotation of Q and K along d, fused into the quantisers |
 
 ### 6.2 Arguments only of `flash_attn_fp4`
 

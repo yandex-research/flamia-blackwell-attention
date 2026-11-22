@@ -291,7 +291,7 @@ configures the kernels.
 | deterministic dQ | off | off |
 | stochastic rounding | off | off |
 | head dims | 64, 128, 256 (256: per-tensor operands and dS, opt-in) | up to 128 in steps of 16 (64 / 128 native, others padded) |
-| sequence lengths | `s % 128 == 0`, or varlen | any |
+| sequence lengths | any (`s % 128 != 0`: the batch rows run as documents, repacked at aligned starts) | any |
 | aligned varlen forward scheduler | persistent longest-first work list over the documents' tiles (L2 head sections); causal: tiles claimed dynamically with Cluster Launch Control (`KernelTuning.varlen_fwd_sched="auto"`), dense: dealt statically | same |
 
 ## Precision routes

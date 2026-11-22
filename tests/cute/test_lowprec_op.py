@@ -92,8 +92,7 @@ def test_op_registered():
 
 
 CASES = [(e, lay, c, h, hk, d) for e in ("fp8", "fp4") for lay in ("batched", "ragged", "varlen", "aligned")
-         for c in (False, True) for (h, hk) in ((4, 4), (8, 2)) for d in (64, 128)
-         if not (e == "fp4" and lay == "ragged")]
+         for c in (False, True) for (h, hk) in ((4, 4), (8, 2)) for d in (64, 128)]
 
 
 @pytest.mark.parametrize("entry,layout,causal,h,hk,d", CASES)
@@ -114,7 +113,7 @@ def test_op_matches_function(monkeypatch, entry, layout, causal, h, hk, d):
 
 
 @pytest.mark.parametrize("entry,layout", [("fp8", "batched"), ("fp4", "batched"), ("fp4", "varlen"),
-                                          ("fp8", "aligned"), ("fp8", "ragged")])
+                                          ("fp8", "aligned"), ("fp8", "ragged"), ("fp4", "ragged")])
 def test_op_no_host_sync(entry, layout):
     qkv, kw, _ = _case(layout, 8, 2, 128)
     kw = dict(kw, causal=True)
@@ -242,6 +241,81 @@ def test_op_compile(entry, layout, backend):
     ref = _step(fn, qkv, kw)
     for a, b in zip(got, ref):
         assert _eq(a, b)
+
+
+def _o4(**kw):
+    from flash_attn.cute.lowprec import FP4AttnOptions
+    return FP4AttnOptions(**kw)
+
+
+def _o8(**kw):
+    from flash_attn.cute.lowprec import FP8AttnOptions
+    return FP8AttnOptions(**kw)
+
+
+# (id, entry, layout, h, hk, kwargs): the call forms of lowprec.api's traced entries
+FULLGRAPH = [
+    ("fp8", "fp8", "batched", 8, 2, {}),
+    ("fp4", "fp4", "batched", 8, 2, {}),
+    ("all4", "fp4", "batched", 8, 8, dict(pv_precision="fp4", backward="fp4", deterministic=False)),
+    # per-tensor 8-bit operands save row_norm2_max[2:3] (byte offset 8): the op's state outputs are whole storages
+    ("fp8_per_tensor", "fp8", "batched", 8, 2, dict(options="o8_per_tensor")),
+    ("fp4_options", "fp4", "batched", 8, 2, dict(options="o4_row_tuned", window_size=(256, 0), return_lse=True)),
+    ("fp8_ragged", "fp8", "ragged", 8, 2, {}),
+    ("fp4_ragged", "fp4", "ragged", 8, 2, {}),
+    ("fp8_varlen", "fp8", "varlen", 8, 2, {}),
+    ("fp4_aligned", "fp4", "aligned", 8, 2, {}),
+]
+
+
+def _fg_options(name):
+    from flash_attn.cute.lowprec import KernelTuning
+    if name == "o8_per_tensor":
+        return _o8(operand_scaling="per_tensor")
+    if name == "o4_row_tuned":
+        return _o4(p_hat_frame="row", tuning=KernelTuning(fwd_mask_loops=1))
+    return name
+
+
+@pytest.mark.parametrize("name,entry,layout,h,hk,kw", FULLGRAPH, ids=[c[0] for c in FULLGRAPH])
+def test_op_compile_fullgraph(name, entry, layout, h, hk, kw):
+    """torch.compile(fullgraph=True): the call is ONE nonstrict_trace node (lowprec.api's traced entries) -- no graph
+    break, options carried as their field values, the varlen glue traced (lp_varlen._launch) -- and O / LSE / dQ / dK /
+    dV are bitwise the eager call's (deterministic; the all-4-bit route's dQ / dK draw fresh stochastic-rounding dither
+    per call: O and dV there). Documents run once eagerly first (the fake implementation reads that entry)."""
+    import torch._dynamo
+    fn = ENTRIES[entry]
+    qkv, base, rows = _case(layout, h, hk, 128)
+    kw = dict(dict(base, causal=True, deterministic=True), **{n: _fg_options(x) if n == "options" else x
+                                                             for n, x in kw.items()})
+    ref = _step(fn, qkv, kw)
+    torch._dynamo.reset()
+    cf = torch.compile(lambda q, k, v: fn(q, k, v, **kw), fullgraph=True)
+    got = _step(lambda q, k, v, **_: cf(q, k, v), qkv, {})
+    exact = (0, 1, 4) if not kw["deterministic"] else range(5)
+    for i in exact:
+        a, b = got[i], ref[i]
+        if rows is not None and a is not None and i != 1:
+            a, b = a[rows], b[rows]
+        assert _eq(a, b, rows, lse=i == 1), (name, i)
+
+
+def test_options_traced_round_trip():
+    """The traced entries carry the options as their field values (dynamo cannot rebuild a frozen dataclass as a
+    nonstrict_trace input): flatten -> rebuild gives an EQUAL object (the same cached plan)."""
+    from flash_attn.cute.lowprec import KernelTuning
+    for cls, fields, o in ((type(_o4()), _api._FP4_FIELDS, _o4(operand_scaling="per_tensor", sr_ds=True)),
+                           (type(_o4()), _api._FP4_FIELDS, _o4(tuning=KernelTuning(fwd_mask_loops=1, e2e_freq=4))),
+                           (type(_o8()), _api._FP8_FIELDS, _o8(p_hat_frame="group")), (type(_o8()), _api._FP8_FIELDS, None)):
+        flat = _api._options_flat(o, fields)
+        assert flat is None or all(isinstance(x, (type(None), bool, int, float, str, tuple)) for x in flat)
+        assert _api._options_of(cls, fields, flat) == o
+
+
+def test_compile_caches_disabled():
+    """Importing lowprec turns torch.compile's on-disk caches off: the ops carry process-local integer handles."""
+    import os
+    assert torch.compiler.config.force_disable_caches or os.environ.get("TORCHINDUCTOR_FORCE_DISABLE_CACHES") == "0"
 
 
 @pytest.mark.parametrize("entry,kw", [("fp4", dict(pv_precision="fp4", backward="fp4")),
