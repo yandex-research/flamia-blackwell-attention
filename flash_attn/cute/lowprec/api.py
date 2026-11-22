@@ -7,11 +7,14 @@ call signature (the arguments and the tensors' metadata), so a training loop res
 
 The node runs as the registered op ``lowbit_attn::fp4`` / ``::fp8`` (lowprec._op: SAC can save it, torch.compile
 traces it) for every call form expressible as an op; user score_mod / mask_mod / aux_tensors and pre-quantised
-operands keep the ``autograd.Function`` (``_LowPrecAttnFunc``) directly.
+operands keep the ``autograd.Function`` (``_LowPrecAttnFunc``) directly. Under torch.compile the op-expressible calls
+(doc_maps excepted) reach dynamo as one ``torch.compiler.nonstrict_trace`` node, so ``fullgraph=True`` works with them
+(the traced entries at the end of this module).
 """
 from __future__ import annotations
 
 import collections
+import dataclasses
 import threading
 import warnings
 from typing import Callable, Literal, Optional, Tuple, Union
@@ -19,7 +22,7 @@ from typing import Callable, Literal, Optional, Tuple, Union
 import torch
 
 from . import _op  # noqa: F401  (registers the ops lowbit_attn::fp4 / ::fp8 on import)
-from .options import FP4AttnOptions, FP8AttnOptions
+from .options import FP4AttnOptions, FP8AttnOptions, KernelTuning
 from .plan import AttnPlan, resolve_fp4, resolve_fp8
 
 __all__ = ["flash_attn_fp4", "flash_attn_fp8"]
@@ -197,6 +200,8 @@ def flash_attn_fp4(
     """4-bit (NVFP4) attention, forward and backward, on Blackwell.
 
     q: (b, s, h, d); k, v: (b, s, h_kv, d); bf16 or fp16; h % h_kv == 0. Packed (total, h, d) with cu_seqlens_*.
+    Any length: every 4-bit operand is built on 128-row tiles, so s % 128 != 0 runs the batch rows as documents
+    (repacked at aligned starts on the GPU and unpacked after, as flash_attn_fp8 and batched seqused_k do).
     Returns out (same dtype as q, (b, s, h, d)); with return_lse=True, (out, lse) with lse (b, h, s) float32 in nats,
     non-differentiable.
 
@@ -247,6 +252,52 @@ def flash_attn_fp4(
         with the precomputed tables (no per-call index building, no host sync; CUDA-graph safe with static maps).
         Outputs are bitwise the repacking path's. return_lse: (h, total_q).
     """
+    if _traced_fp4 is not None and torch.compiler.is_compiling() and _op_expressible(
+            q, score_mod, score_mod_bwd, mask_mod, aux_tensors, doc_maps, q_descale, k_descale, v_descale) \
+            and (options is None or isinstance(options, FP4AttnOptions)):
+        # torch.compile: the call is ONE opaque node for dynamo (fullgraph=True works); AOTAutograd traces its Python
+        # -- the plan, the varlen glue, the lowbit_attn op -- with fake tensors (see _traced_fp4)
+        return _traced_fp4(q, k, v, _options_flat(options, _FP4_FIELDS), softmax_scale, causal, window_size, softcap,
+                           cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, seqused_k, seqused_q, deterministic,
+                           return_lse, pv_precision, backward, causal_safety, qk_hadamard)
+    return _fp4_impl(q, k, v, softmax_scale=softmax_scale, causal=causal, window_size=window_size, softcap=softcap,
+                     score_mod=score_mod, score_mod_bwd=score_mod_bwd, mask_mod=mask_mod, aux_tensors=aux_tensors,
+                     cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q,
+                     max_seqlen_k=max_seqlen_k, seqused_k=seqused_k, seqused_q=seqused_q, deterministic=deterministic,
+                     return_lse=return_lse, pv_precision=pv_precision, backward=backward, causal_safety=causal_safety,
+                     qk_hadamard=qk_hadamard, options=options, q_descale=q_descale, k_descale=k_descale,
+                     v_descale=v_descale, doc_maps=doc_maps)
+
+
+def _fp4_impl(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    softcap: float = 0.0,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[tuple] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    return_lse: bool = False,
+    pv_precision: Literal["fp8", "fp4"] = "fp8",
+    backward: Literal["e4m3", "fp4"] = "e4m3",
+    causal_safety: Literal["auto", "key_local", "diagonal", "off"] = "auto",
+    qk_hadamard: Optional[bool] = None,
+    options: Optional[FP4AttnOptions] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    doc_maps=None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """flash_attn_fp4's body (the eager path, and the traced entry's)."""
     if q_descale is not None or k_descale is not None or v_descale is not None or \
             any(isinstance(t, torch.Tensor) and t.dtype == torch.float8_e4m3fn for t in (q, k, v)):
         from .prequant_fa3 import refuse_fp4
@@ -321,6 +372,53 @@ def flash_attn_fp8(
     leaves cannot carry one); the backward reuses the caller's codes and quantises dO itself.
     doc_maps: as flash_attn_fp4 (not with pre-quantised inputs).
     """
+    if _traced_fp8 is not None and torch.compiler.is_compiling() and _op_expressible(
+            q, score_mod, score_mod_bwd, mask_mod, aux_tensors, doc_maps, q_descale, k_descale, v_descale) \
+            and q_quantized is None and k_quantized is None and not q_scale_fused and grad_proxies is None \
+            and (options is None or isinstance(options, FP8AttnOptions)):
+        # torch.compile: the call is ONE opaque node for dynamo (fullgraph=True works); see flash_attn_fp4
+        return _traced_fp8(q, k, v, _options_flat(options, _FP8_FIELDS), softmax_scale, causal, window_size, softcap,
+                           cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, seqused_k, seqused_q, deterministic,
+                           return_lse, qk_hadamard)
+    return _fp8_impl(q, k, v, softmax_scale=softmax_scale, causal=causal, window_size=window_size, softcap=softcap,
+                     score_mod=score_mod, score_mod_bwd=score_mod_bwd, mask_mod=mask_mod, aux_tensors=aux_tensors,
+                     cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q,
+                     max_seqlen_k=max_seqlen_k, seqused_k=seqused_k, seqused_q=seqused_q, deterministic=deterministic,
+                     return_lse=return_lse, qk_hadamard=qk_hadamard, q_quantized=q_quantized, k_quantized=k_quantized,
+                     q_scale_fused=q_scale_fused, options=options, q_descale=q_descale, k_descale=k_descale,
+                     v_descale=v_descale, grad_proxies=grad_proxies, doc_maps=doc_maps)
+
+
+def _fp8_impl(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    softcap: float = 0.0,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[tuple] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    return_lse: bool = False,
+    qk_hadamard: Optional[bool] = None,
+    q_quantized=None,
+    k_quantized=None,
+    q_scale_fused: bool = False,
+    options: Optional[FP8AttnOptions] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    grad_proxies: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    doc_maps=None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """flash_attn_fp8's body (the eager path, and the traced entry's)."""
     if doc_maps is not None:
         if q_quantized is not None or k_quantized is not None:
             raise ValueError("flash_attn_fp8(doc_maps=...): q_quantized / k_quantized take the aligned varlen form "
@@ -367,3 +465,90 @@ def flash_attn_fp8(
     return _run(plan, q, k, v, score_mod=score_mod, score_mod_bwd=score_mod_bwd, mask_mod=mask_mod,
                 aux_tensors=aux_tensors, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, seqused_k=seqused_k,
                 prequant=prequant, seqused_q=seqused_q, doc_maps=doc_maps)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# torch.compile: the traced entries
+# ---------------------------------------------------------------------------------------------------------------------
+# Under torch.compile an op-expressible call (no user score_mod / mask_mod / aux_tensors, no pre-quantised operands, no
+# doc_maps) reaches dynamo as ONE opaque call: torch.compiler.nonstrict_trace. Dynamo does not trace into it -- the
+# host-side Python (the plan cache and its lock, the plan's dataclasses, the op's registries) costs no graph break, so
+# fullgraph=True works -- while AOTAutograd traces it with fake tensors: the plan resolution runs as plain Python, the
+# varlen glue's torch ops and Triton launches (lp_varlen: torch.library.wrap_triton while tracing) and the lowbit_attn
+# op (its fake implementation) become graph nodes, and the op's registered autograd formula gives the backward. Every
+# other call form keeps the eager path, which dynamo traces up to its graph breaks (fullgraph=True refuses those).
+#
+# A nonstrict_trace-d function takes pytree leaves (tensors, None, int / float / bool / str) or registered constants
+# only, and dynamo cannot rebuild a frozen dataclass as a constant ("currently can't reconstruct arbitrary frozen
+# dataclass instances", even registered with pytree.register_constant), so the options travel as the tuple of their
+# field values (KernelTuning as one more tuple): primitives dynamo specialises on and guards, rebuilt inside the entry
+# -- equal to the caller's object, hence the same cached plan.
+_NONSTRICT = getattr(torch.compiler, "nonstrict_trace", None)   # torch >= 2.7
+_FP4_FIELDS = tuple(f.name for f in dataclasses.fields(FP4AttnOptions))
+_FP8_FIELDS = tuple(f.name for f in dataclasses.fields(FP8AttnOptions))
+_TUNING_FIELDS = tuple(f.name for f in dataclasses.fields(KernelTuning))
+
+
+def _op_expressible(q, score_mod, score_mod_bwd, mask_mod, aux_tensors, doc_maps, q_descale, k_descale, v_descale):
+    """The call forms of the traced entries: what the lowbit_attn ops serve (no user callables, no pre-quantised
+    operands: lowprec.api._run), doc_maps excepted (its packed-row carriers are registered by data pointer)."""
+    return (score_mod is None and score_mod_bwd is None and mask_mod is None and aux_tensors is None
+            and doc_maps is None and q_descale is None and k_descale is None and v_descale is None
+            and isinstance(q, torch.Tensor) and q.dtype != torch.float8_e4m3fn)
+
+
+def _options_flat(options, names):
+    """FP4AttnOptions / FP8AttnOptions -> the tuple of its field values (None stays None)."""
+    if options is None:
+        return None
+    return tuple((None if options.tuning is None else tuple(getattr(options.tuning, t) for t in _TUNING_FIELDS))
+                 if n == "tuning" else getattr(options, n) for n in names)
+
+
+def _options_of(cls, names, flat):
+    """The inverse of _options_flat (validated again by the classes' __post_init__)."""
+    if flat is None:
+        return None
+    kw = dict(zip(names, flat))
+    if kw.get("tuning") is not None:
+        kw["tuning"] = KernelTuning(**dict(zip(_TUNING_FIELDS, kw["tuning"])))
+    return cls(**kw)
+
+
+def _surfaced(entry: str, fn):
+    """fn(); an exception raised while torch.compile traces the call is also issued as a warning: dynamo reports any
+    RuntimeError raised inside a nonstrict_trace-d call as "Unsupported output type for nonstrict_trace-ed function"
+    and drops its message (the plan's refusals, or the fake implementation's "run a document-table call once
+    eagerly first")."""
+    try:
+        return fn()
+    except Exception as e:
+        from torch.utils._python_dispatch import is_in_torch_dispatch_mode
+        if is_in_torch_dispatch_mode():
+            warnings.warn(f"flash_attn_{entry} could not be traced by torch.compile: {type(e).__name__}: {e}",
+                          stacklevel=3)
+        raise
+
+
+def _fp4_entry(q, k, v, options, softmax_scale, causal, window_size, softcap, cu_seqlens_q, cu_seqlens_k,
+               max_seqlen_q, max_seqlen_k, seqused_k, seqused_q, deterministic, return_lse, pv_precision, backward,
+               causal_safety, qk_hadamard):
+    return _surfaced("fp4", lambda: _fp4_impl(
+        q, k, v, softmax_scale=softmax_scale, causal=causal, window_size=window_size, softcap=softcap,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k, seqused_q=seqused_q, deterministic=deterministic, return_lse=return_lse,
+        pv_precision=pv_precision, backward=backward, causal_safety=causal_safety, qk_hadamard=qk_hadamard,
+        options=_options_of(FP4AttnOptions, _FP4_FIELDS, options)))
+
+
+def _fp8_entry(q, k, v, options, softmax_scale, causal, window_size, softcap, cu_seqlens_q, cu_seqlens_k,
+               max_seqlen_q, max_seqlen_k, seqused_k, seqused_q, deterministic, return_lse, qk_hadamard):
+    return _surfaced("fp8", lambda: _fp8_impl(
+        q, k, v, softmax_scale=softmax_scale, causal=causal, window_size=window_size, softcap=softcap,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k, seqused_q=seqused_q, deterministic=deterministic, return_lse=return_lse,
+        qk_hadamard=qk_hadamard, options=_options_of(FP8AttnOptions, _FP8_FIELDS, options)))
+
+
+_traced_fp4 = _NONSTRICT(_fp4_entry) if _NONSTRICT is not None else None
+_traced_fp8 = _NONSTRICT(_fp8_entry) if _NONSTRICT is not None else None

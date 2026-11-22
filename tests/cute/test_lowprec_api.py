@@ -113,7 +113,7 @@ RULES = [
      "p_frame='per_tile' is not defined on the integer-frame all-FP4 step"),
     ("r26", F4, dict(options=O4(seqused_k_group_aligned=True), **PV4), {}, ValueError, 26,
      "seqused_k_group_aligned applies to seqused_k with a 4-bit P.V, which no route takes"),
-    ("r27", F4, {}, dict(s=1000), ValueError, 27, "flash_attn_fp4 needs seqlen % 128 == 0"),
+    # (s % 128 != 0 is no longer refused: ragged lengths run as documents -- TB_SHAPES, test_lowprec_ragged.py)
     ("r27b", F4, dict(**ALL), dict(d=64), ValueError, 27, "backward='fp4' needs head_dim 128"),
     ("r27c", F4, dict(causal=True, **PV4), dict(d=64), NotImplementedError, 27,
      "pv_precision='fp4' (the 4-bit P.V, option A) is built for head_dim 128"),
@@ -495,6 +495,16 @@ def test_defaults_resolved():
     p = resolve_fp8(*qkv(s=1000), causal=True, options=O8(operand_scaling="per_tensor"))
     assert (p.fwd.kernel, p.fwd.operand_scaling, p.bwd.kernel, p.fwd.ragged_documents) == \
         ("upstream_fp8", "per_tensor", "1cta", False)
+    # the 4-bit entry likewise: every 4-bit operand is a 128-row tile, so ragged batch rows run as documents on every
+    # route (it used to refuse them: rule 27), batched seqused_k with such lengths keeps its own documents flag
+    for kw, kernel in (({}, "fork_fp4"), (dict(ALL), "fork_fp4_all"), (dict(PV4), "fork_fp4")):
+        p = resolve_fp4(*qkv(s=1000, rg="pv_precision" not in kw or "backward" in kw), causal=True, **kw)
+        assert (p.fwd.kernel, p.fwd.ragged_documents, p.fwd.varlen, p.fwd.seqused_k) == (kernel, True, False, False), kw
+        assert ("documents", "ragged") in [(f, v) for f, v, _ in p.resolution_log], kw
+    p = resolve_fp4(*qkv(s=1000), causal=True)
+    assert (p.fwd.operand_scaling, p.fwd.qk_hadamard) == ("token_block", True)
+    p = resolve_fp4(*qkv(s=1000), seqused_k=torch.full((1,), 700, dtype=torch.int32, device="meta"))
+    assert (p.fwd.ragged_documents, p.fwd.seqused_k) == (False, True)
     # s_q != s_k: token blocks (the factor table indexes Q / dO rows by query block, K / V by key block)
     for entry in (resolve_fp4, resolve_fp8):
         for sq, sk in ((1024, 2048), (2048, 1024)):
@@ -1378,6 +1388,10 @@ TB_SHAPES = [  # (id, entry, b, s_q, s_k, h, h_kv, d, causal)
     ("fp8_d96_causal", F8, 2, 1024, 1024, 4, 4, 96, True),
     ("fp8_d32_dense", F8, 2, 1024, 1024, 4, 4, 32, False),
     ("fp8_d80_ragged_gqa", F8, 2, 1000, 1000, 8, 2, 80, True),
+    ("fp4_ragged_causal", F4, 2, 1000, 1000, 4, 4, 128, True),
+    ("fp4_ragged_sq_ne_sk", F4, 2, 700, 1000, 4, 4, 128, True),
+    ("fp4_ragged_dense_gqa_d64", F4, 2, 1000, 1000, 8, 2, 64, False),
+    ("fp4_ragged_short", F4, 3, 129, 129, 4, 4, 128, True),
 ]
 
 
@@ -1412,8 +1426,8 @@ def test_token_block_fallback_shapes(name, entry, b, sq, sk, h, hk, d, causal):
 
 
 @gpu
-@pytest.mark.parametrize("name,entry,b,sq,sk,h,hk,d,causal", [TB_SHAPES[i] for i in (0, 1, 5, 7, 9)],
-                         ids=[TB_SHAPES[i][0] for i in (0, 1, 5, 7, 9)])
+@pytest.mark.parametrize("name,entry,b,sq,sk,h,hk,d,causal", [TB_SHAPES[i] for i in (0, 1, 5, 7, 9, 12)],
+                         ids=[TB_SHAPES[i][0] for i in (0, 1, 5, 7, 9, 12)])
 def test_token_block_fallback_shapes_graph_sync_det(name, entry, b, sq, sk, h, hk, d, causal):
     """The new token-block shapes: no host sync, CUDA-graph capture bitwise the eager step, deterministic=True bitwise
     across calls."""

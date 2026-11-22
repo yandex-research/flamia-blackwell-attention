@@ -1010,11 +1010,14 @@ def resolve_fp4(q, k, v, *, softmax_scale=None, causal=False, window_size=(None,
         _fail("E13", NotImplementedError, f"flash_attn_fp4 serves head_dim 64, 128 and 256; got {shp.d} (the "
                                           "block-scaled operands are 64 or 128 wide, or two 128-wide halves).")
 
-    # ---- rule 27: the scale-factor atom and the query-row kernel's head dim -------------------------------------------
-    # (varlen documents are repacked at 128-aligned starts by the step itself: any lengths)
-    if not shp.varlen and (tot_q % 128 != 0 or tot_k % 128 != 0):
-        _fail(27, ValueError, f"flash_attn_fp4 needs seqlen % 128 == 0 (the scale-factor atom is 128 rows); got "
-                              f"s_q = {tot_q}, s_k = {tot_k}. flash_attn_fp8 serves other lengths.")
+    # ---- rule 27: the query-row kernel's head dim; ragged lengths --------------------------------------------------
+    # Every 4-bit operand and kernel is built on 128-row tiles (the scale-factor atom). Batched lengths that are not
+    # multiples of 128 run the batch rows as documents, repacked at aligned starts on the GPU -- as flash_attn_fp8's
+    # ragged rows and batched seqused_k do (varlen documents are repacked by the step itself: any lengths).
+    ragged = not shp.varlen and (tot_q % 128 != 0 or tot_k % 128 != 0)
+    if ragged:
+        log("documents", "ragged", f"s % 128 != 0 (s_q {tot_q}, s_k {tot_k}): the batch rows run as documents repacked "
+                                   "at aligned starts")
     if backward == "fp4" and shp.d != 128:
         _fail(27, ValueError, f"backward='fp4' needs head_dim 128 (the query-row kernel); got {shp.d}.")
     if pv_precision == "fp4" and shp.d != 128:
@@ -1177,7 +1180,7 @@ def resolve_fp4(q, k, v, *, softmax_scale=None, causal=False, window_size=(None,
     _check_features("fp4", route, feats, causal, window, softcap, score_mod, score_mod_bwd, mask_mod, shp, return_lse,
                     grad, False, None if backward == "fp4" else
                     ("per_tensor" if o.ds_scaling == "auto" and shp.d > 128 else "block_32x32"), log)
-    docs = shp.varlen or shp.seqused_k
+    docs = shp.varlen or shp.seqused_k or ragged
 
     # ---- options that only one route reads (no silent no-ops) -------------------------------------------------------------
     if o.p_consistency != "reproduce_forward_p" and not (pv_precision == "fp4" and backward == "e4m3"):
@@ -1395,7 +1398,7 @@ def resolve_fp4(q, k, v, *, softmax_scale=None, causal=False, window_size=(None,
                   qk_hadamard=qk_hadamard, v_hadamard=o.v_hadamard, causal=causal, window=window, softcap=softcap,
                   score_mod=score_mod is not None, mask_mod=mask_mod is not None, varlen=shp.varlen,
                   seqused_k=shp.seqused_k, return_lse=return_lse, per_tensor_scale=pts,
-                  aligned_varlen=shp.aligned_varlen,
+                  aligned_varlen=shp.aligned_varlen, ragged_documents=ragged and not shp.seqused_k,
                   two_cta=_resolve_fwd_two_cta(o.forward_two_cta, shp, causal, route == "fp4.e4m3_pv",
                                                bool(_mods(feats)), False, False, log,
                                                nvfp4_qk_row_p_token_block=bool(

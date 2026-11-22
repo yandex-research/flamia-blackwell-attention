@@ -1400,7 +1400,7 @@ def run_documents(plan: AttnPlan, q, k, v, apply_fn, *, cu_seqlens_q, cu_seqlens
         return run_aligned(plan, q, k, v, apply_fn, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
                            seqused_q=seqused_q, seqused_k=seqused_k, mask_kw=mask_kw)
     if (plan.fwd.operand_scaling == "per_tensor" or plan.route in ("fp4.all_fp4", "fp4.fp4_pv")) \
-            and (s.varlen or s.seqused_k):
+            and (s.varlen or s.seqused_k or plan.fwd.ragged_documents):
         # (the 4-bit P.V routes: their per-document statistics and tables are the aligned path's too)
         # per-(document, kv head) per-tensor operands on repacked varlen / batched seqused_k: the aligned path on the
         # repacked buffer (the per-document scale tables are the aligned path's); the token-block repack is unchanged
